@@ -58,6 +58,28 @@ currently uses about 737 MB. Caveats: `VmRSS`, not peak `VmHWM`; SQLite page
 cache and allocator retention included; corpus is synthetic and smaller than a
 live library in some dimensions.
 
+## Live read-only sync check (2026-11-03)
+
+Method: a local SQLite backup of the live jproxy database was used; the release
+binary ran locally for 240 seconds with `SYNC_ENABLED=true`, with
+`SONARR_URL`/`RADARR_URL` overridden to the LAN addresses. API keys and TMDB
+settings came from the copied `system_config` at runtime. No `/mnt/user` writes
+and no NAS service changes were made; the copy was deleted afterwards.
+
+Results:
+
+- Sonarr titles synced: 46.
+- Radarr titles synced: 1,402 source rows.
+- Sonarr rules synced: 90 across authors `LuckyPuppy514` (85), `grc` (1),
+  `haha` (4).
+- Radarr rules synced: 38 from `LuckyPuppy514`; `grc`/`haha` fetches failed and
+  were skipped per-author, as designed.
+- TMDB rows: no new rows; the existing 20 rows satisfied the need-sync query.
+- DB counts after the run: 46 / 1535 / 20 / 90 / 38 / 20 (titles, rules, config),
+  unchanged because the sync is upsert-only.
+- The process was stopped by the 240-second bound; this is expected for a
+  long-running server.
+
 ## Deviations from Java
 
 - Hourly/daily sync starts from process start rather than Java's fixed
@@ -74,8 +96,9 @@ live library in some dimensions.
 
 ## Not covered by this baseline
 
-- Live synchronization A/B against the real Sonarr/Radarr/TMDB/GitHub
-  endpoints. All synchronization tests use local mocks and synthetic values.
+- Full live A/B for synchronization writes. A read-only live sync check was
+  performed (see above); the remaining synchronization tests use local mocks and
+  synthetic values.
 - Exact cron alignment and Java's admin cache controls.
 - Extra features: qBittorrent/Transmission login, rename tasks, admin UI/API,
   login/session, example/cache/system-config REST endpoints.
