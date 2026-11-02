@@ -113,7 +113,11 @@ pub struct Config {
     pub radarr_rename_fallback: Duration,
     /// Java `rename.file`: also rename the files inside each torrent.
     pub rename_file: bool,
-    /// Parsed for compatibility with the Java deployment. Phase 1 has no auth.
+    /// Java `time.token-expires`, in minutes.
+    pub token_expires: Duration,
+    /// Directory containing the compiled Java admin UI (`admin_dist`).
+    pub admin_ui_dir: PathBuf,
+    /// Parsed for compatibility with the Java deployment.
     pub login_enabled: bool,
     pub sync_enabled: bool,
     pub request_timeout: Duration,
@@ -198,6 +202,12 @@ impl Config {
                 env_minutes("RADARR_RENAME_FALLBACK_MINS", 30)?.saturating_mul(60),
             ),
             rename_file: env_bool("RENAME_FILE", true)?,
+            token_expires: Duration::from_secs(
+                env_minutes("TOKEN_EXPIRES", 10080)?.saturating_mul(60),
+            ),
+            admin_ui_dir: env_string("ADMIN_UI_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("admin_dist")),
             login_enabled: env_bool("LOGIN_ENABLED", false)?,
             sync_enabled,
             request_timeout: Duration::from_secs(env_u64("REQUEST_TIMEOUT_SECS", 30)?),
@@ -475,6 +485,8 @@ mod tests {
             sonarr_rename_fallback: Duration::from_secs(1800),
             radarr_rename_fallback: Duration::from_secs(1800),
             rename_file: false,
+            token_expires: Duration::from_secs(10080 * 60),
+            admin_ui_dir: PathBuf::from("admin_dist"),
             login_enabled: false,
             sync_enabled: true,
             request_timeout: Duration::from_secs(5),

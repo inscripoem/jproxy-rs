@@ -141,6 +141,20 @@ impl SyncState {
     pub async fn clear_tmdb_gate(&self) {
         *self.tmdb_gate.lock().await = None;
     }
+
+    /// Java clears `sonarr_title_sync_interval` / `radarr_title_sync_interval`
+    /// when a manual sync fails or when system configuration is updated.
+    pub async fn clear_title_gate(&self, kind: AppKind) {
+        *self.title_gate(kind).lock().await = None;
+    }
+
+    /// Used by the cache clear-all endpoint.
+    pub async fn clear_all_gates(&self) {
+        for kind in [AppKind::Sonarr, AppKind::Radarr] {
+            self.clear_title_gate(kind).await;
+        }
+        self.clear_tmdb_gate().await;
+    }
 }
 
 impl Default for SyncState {

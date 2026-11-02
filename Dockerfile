@@ -10,6 +10,7 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+COPY admin_dist ./admin_dist
 RUN cargo build --release --locked \
     && mkdir -p /data \
     && touch /data/.keep \
@@ -19,10 +20,12 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 
 WORKDIR /app
 COPY --from=builder /build/target/release/jproxy-rs /usr/local/bin/jproxy-rs
+COPY --from=builder /build/admin_dist /app/admin_dist
 COPY --from=builder --chown=65532:65532 /data /data
 
 ENV DATABASE_PATH=/data/jproxy.db \
     LISTEN_ADDR=0.0.0.0:8117 \
+    ADMIN_UI_DIR=/app/admin_dist \
     RUST_LOG=jproxy_rs=info,tower_http=info
 
 EXPOSE 8117

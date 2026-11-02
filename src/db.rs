@@ -12,6 +12,7 @@ use crate::models::{AppKind, MatchedTitle, Rule, TitleCandidate};
 use crate::text::{clean_title, remove_season};
 
 const SCHEMA: &str = include_str!("../migrations/0001_schema.sql");
+const ADMIN_SEED: &str = include_str!("../migrations/0002_admin_seed.sql");
 
 pub async fn connect(path: &Path) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::new()
@@ -45,6 +46,13 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await
         .context("initialize SQLite schema")?;
+    // Matches the Java Liquibase first-run rows. The seed is keyed by
+    // username/config key, so an imported upstream database is never
+    // overwritten and its own user/settings are preserved.
+    sqlx::raw_sql(ADMIN_SEED)
+        .execute(pool)
+        .await
+        .context("initialize admin seed rows")?;
     Ok(())
 }
 

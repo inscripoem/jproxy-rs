@@ -176,23 +176,136 @@ MB baseline target and the 100 MB full-parity target.
 - No live A/B was performed against a real downloader or NAS. The feature tests
   are mock-only by design; activation requires a user-run deployment check.
 
-## Not covered by this baseline
+## Admin UI, API and authentication phase
+
+Commit on `features/full-parity`: `jproxy-rs: admin ui api auth parity`
+(not pushed).
+
+### Implemented admin surface
+
+All paths, methods, camelCase JSON fields, and `current`/`pageSize` pagination
+follow the Java controllers:
+
+- `/api/sonarr/rule`, `/api/radarr/rule`: `sync`, `query`, `save`, `remove`,
+  `enable`, `disable`, `export`, multipart `import`, `token/list`.
+- `/api/sonarr/title`, `/api/radarr/title`: `sync`, `query`, `remove`.
+- `/api/sonarr/example`, `/api/radarr/example`: `save`, `query`, `remove`,
+  including Java's recomputed `formatText`/`validStatus` and the
+  `validStatus`-filtered manual pagination path.
+- `/api/rule/test`: regex replacement plus numeric offset.
+- `/api/tmdb/title`: `sync`, `query` with computed `cleanTitle`, `remove`,
+  `save` (including copying `tmdbId` from an existing `tvdbId` row).
+- `/api/system/config`: `version`, `query` (runs the Sonarr rename pass first,
+  like Java), `update`, `author/list`.
+- `/api/system/user`: `login`, `logout`, `info`, `update`, `isLoginEnabled`.
+- `/api/system/cache`: `clearAll`, `clear` by Java cache name.
+- Rule save/import preserves MyBatis `NOT_NULL` update semantics, protects the
+  primary rule ID, rejects invalid regexes, and generates the Java UUID shape.
+- Admin CRUD clears the formatting/title caches at the same points as Java.
+
+### Authentication
+
+- `LOGIN_ENABLED=false` returns an Anonymous JWT from `login`; `update` then
+  returns `401`. All `/api/**` routes except `login` and `isLoginEnabled`
+  still require a valid bearer token, matching `LoginInterceptor`.
+- The default first-run account is `jproxy` / `jproxy@2023`, seeded with the
+  upstream hash. The compiled UI hashes the typed password with MD5 before
+  sending it and the service hashes it once more, so non-UI clients must send
+  uppercase MD5.
+- HS256 JWT with a random per-process secret, claims `id`, `username`,
+  `password`, `role`, `valid_status`, `exp`, `iat`; `TOKEN_EXPIRES` defaults to
+  10080 minutes. Logout blacklists the raw `Authorization` header. More than
+  ten wrong logins block login globally until restart.
+- `/health` and all four Torznab proxy routes remain public.
+- Passwords, password hashes, tokens, cookies, API keys, and
+  `system_config` values are never logged.
+
+### Admin UI and database
+
+- The Java `src/main/resources/dist` directory was copied to `admin_dist/`
+  (101 files plus the upstream MIT `LICENSE.txt`). It is served from disk at
+  `/` with SPA fallback.
+- Reserved prefixes are matched before the UI fallback: `/health`, the Torznab
+  routes, and `/api/**` cannot be shadowed. Unknown `/api/**` paths require
+  auth and return `403`/`404`; unknown `/sonarr|radarr/**` paths return `404`.
+- `migrations/0002_admin_seed.sql` adds the upstream first-run `system_user`
+  (`jproxy`) and the 20 final `system_config` rows with `INSERT OR IGNORE`.
+  Reference tables and existing values are preserved.
+
+### Verification
+
+- `cargo fmt --check`: pass.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo test`: **133 passed, 0 failed** — 72 unit, 16 admin, 5 downloader,
+  10 parity, 3 real-data, 7 rename, 14 sync, 6 upstream-error. All admin tests
+  use synthetic users and credentials.
+- `cargo build --release`: pass; binary 8.8 MB. Vendored UI 3.1 MB.
+
+### Resource measurements
+
+Method: release binary, temporary SQLite database, `admin_dist/` served from
+disk, local mock Torznab upstream, `SYNC_ENABLED=false`, `MIN_COUNT=0`,
+`LOGIN_ENABLED=true`, and a synthetic admin user. Seeded data: 200 Sonarr
+titles, 200 Radarr titles, 200 rules, 100 examples, 100 TMDB rows. Five
+`VmRSS` samples 0.3 seconds apart per phase. Admin calls covered login, user
+info, config query, rule/title/example/TMDB queries, a rule save, UI root and
+JS asset, and cache clear-all. The load phase used 2,000 Torznab queries,
+concurrency 16, 500 distinct `q` values. No live service or real credential
+was used, and the synthetic password never appeared in the logs.
+
+| Phase | Workload | RSS |
+| --- | --- | --- |
+| Idle, admin UI enabled | Seeded database, no admin/proxy requests | 10,468 KB (10.2 MB) |
+| After representative admin calls | Login, CRUD/format queries, static UI, cache clear | 13,184 KB (12.9 MB) |
+| Under proxy load | 2,000 queries, concurrency 16, 500 distinct `q` | 20,532 KB (20.1 MB) |
+
+Samples were stable within each phase. Values are current `VmRSS`, not peak
+`VmHWM`, and include SQLite page cache and allocator retention.
+
+### Deviations
+
+- `/api/system/config/update` validates syntax (URL shape, required format
+  tokens, regex compilation, credential presence) instead of probing
+  Sonarr/Radarr/TMDB and both downloaders over HTTP. UI validity icons can
+  differ from Java until a live login succeeds.
+- Config updates persist immediately but runtime behaviour uses the startup
+  configuration; restart to apply. Java reloads through its config cache.
+- `config/version` reports the Rust package version without the GitHub release
+  check.
+- Cache clear operations map Java cache names onto this service's caches; the
+  exact Caffeine eviction/expiry internals are not reproduced.
+- The static UI is served from disk rather than embedded in the binary.
+- Example pagination clamps a page beyond the end to an empty slice where Java
+  could throw on `subList`.
+
+### Remaining gaps
+
+- Charon downloader proxy routes (`/sonarr|radarr/qbittorrent|transmission`).
+  They are also inactive in the current Java build: no Charon dependency and no
+  route configuration, so this is not a working Java endpoint.
+- No live A/B or deployment test of admin login/CRUD against the NAS service.
+  Tests use the in-process router, temporary databases, and synthetic users.
+- No live validation probes during config updates, and no config hot reload.
+- No Java distributed/persistent cache backend.
+
+No `/mnt/user` writes, no NAS service changes, and no real secrets were printed,
+logged, or committed. All measurements used temporary files outside the NAS.
+
+## Not covered by this phase
 
 - Full live A/B for synchronization writes. A read-only live sync check was
   performed (see above); the remaining synchronization tests use local mocks and
   synthetic values.
-- Exact cron alignment and Java's admin cache controls.
-- Remaining extra features: admin UI/API, login/session, example/cache/
-  system-config REST endpoints, and downloader API proxying. Downloader login
-  and rename tasks are implemented above.
+- Exact Java cron alignment.
+- Downloader API proxying (the Charon routes). They are inactive in the current
+  Java build and remain a follow-up.
+- Live config-update probes and config hot reload.
+- A live deployment check of admin login/CRUD against the NAS service.
 
 ## Review questions
 
-1. Accept the baseline resource profile (9.5-28.0 MB) and the documented
+1. Accept the admin feature profile (10.2-20.1 MB RSS) and the documented
    deviations?
-2. Allow the `features/full-parity` worktree to fast-forward from `8b976fa` to
-   `6f5bedb`, then start the extra-feature implementation?
-3. Do a live read-only synchronization check against the real Sonarr/Radarr/
-   TMDB/GitHub endpoints before or after the extra features?
-4. Accept the downloader/rename feature profile (9.8-14.0 MB RSS) and the
-   documented mock-only verification?
+2. Schedule the Charon downloader proxy routes as a separate follow-up?
+3. Accept syntactic config validation and restart-to-apply as the shipped
+   behaviour, or require live probes/hot reload in a later phase?

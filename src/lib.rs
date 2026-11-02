@@ -1,4 +1,7 @@
+pub mod admin;
+pub mod admin_db;
 pub mod app;
+pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod db;

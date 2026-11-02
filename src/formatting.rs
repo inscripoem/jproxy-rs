@@ -78,6 +78,45 @@ impl FormattingData {
         }
     }
 
+    /// Load reference data for the admin example preview.
+    ///
+    /// Unlike feed formatting, the Java example query still runs when no title
+    /// rule matches: it substitutes a localized "match title fail" message and
+    /// then applies the remaining token rules.
+    pub async fn load_example(
+        pool: &SqlitePool,
+        kind: AppKind,
+        format: &str,
+        clean_regex: Regex,
+    ) -> Result<Self> {
+        let tokens = token_names(format);
+        let rules = db::load_rules(pool, kind).await?;
+        let rules = RuleSet::new(rules, &tokens);
+        let candidates = db::load_title_candidates(pool, kind).await?;
+        Ok(Self {
+            kind,
+            format: format.to_owned(),
+            clean_regex,
+            rules,
+            candidates,
+        })
+    }
+
+    /// Java `SonarrTitleService.formatTitle` followed by `format` for the
+    /// admin example table.
+    pub fn format_example_text(&self, text: &str, fail_text: &str) -> String {
+        let mut format = self.format.clone();
+        self.apply_title_rules(text, &mut format);
+        if format.contains("{title}") {
+            format = replace_token("title", fail_text, &format);
+        }
+        format = self.apply_token_rules(text, format);
+        if self.kind == AppKind::Sonarr && format.contains("{episode}") {
+            return text.to_owned();
+        }
+        remove_all_tokens(&format).trim().to_owned()
+    }
+
     pub fn format_item_title(&self, title: &str, description: Option<&str>) -> Option<String> {
         let text = title.replace(['\r', '\n'], " ");
         let mut format = self.format.clone();
@@ -369,6 +408,28 @@ mod tests {
         assert_eq!(
             data.format_item_title("Main.Movie.2024", Some("[SubsPlease]")),
             Some("Main Movie SubsPlease".to_owned())
+        );
+    }
+
+    #[test]
+    fn example_formats_a_loose_clean_title_rule() {
+        let rules = vec![rule(
+            "primary",
+            "title",
+            999,
+            ".*(\\b|\\s){cleanTitle}(\\b|\\s).*",
+            "{mainTitle}",
+        )];
+        let data = FormattingData::from_parts(
+            AppKind::Sonarr,
+            "{title}",
+            clean_regex(),
+            rules,
+            vec![candidate("Main Show", "Main Show", "main show")],
+        );
+        assert_eq!(
+            data.format_example_text("Main Show S01E01", "Match Title Fail"),
+            "Main Show"
         );
     }
 

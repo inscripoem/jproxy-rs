@@ -3,15 +3,16 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderValue, Request, StatusCode, header};
+use axum::http::{HeaderValue, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get};
 use axum::{Json, Router};
 use regex::Regex;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tower_http::trace::TraceLayer;
 
+use crate::auth::AuthState;
 use crate::cache::{Expiry, TtlCache};
 use crate::config::Config;
 use crate::db;
@@ -36,6 +37,7 @@ pub struct AppState {
     pub title_cache: Arc<TtlCache<TitleLookup>>,
     pub sync: Arc<SyncState>,
     pub clean_title_regex: Arc<Regex>,
+    pub auth: Arc<AuthState>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +89,7 @@ impl AppState {
             config.cache_max_entries,
             Expiry::AfterAccess,
         ));
+        let auth = Arc::new(AuthState::new(config.login_enabled, config.token_expires)?);
         Ok(Self {
             config: Arc::new(config),
             pool,
@@ -97,6 +100,7 @@ impl AppState {
             title_cache,
             sync: Arc::new(SyncState::new()),
             clean_title_regex: Arc::new(clean_title_regex),
+            auth,
         })
     }
 
@@ -187,8 +191,79 @@ pub fn router(state: AppState) -> Router {
         .route("/radarr/prowlarr/{indexer_id}/api", get(radarr_prowlarr))
         .route("/radarr/jackett/{indexer_id}/api", get(radarr_jackett))
         .route("/health", get(health))
+        .merge(crate::admin::router(state.clone()))
+        // Unknown reserved paths must not fall through to the SPA. The admin
+        // router owns `/api/**`, including its unknown paths.
+        .route("/sonarr/{*rest}", any(crate::admin::reserved_not_found))
+        .route("/radarr/{*rest}", any(crate::admin::reserved_not_found))
+        .fallback(static_fallback)
         .layer(trace)
         .with_state(state)
+}
+
+/// Serve the compiled Java admin UI with SPA fallback.
+///
+/// The fallback is reached only for paths that did not match a proxy, health,
+/// admin API or reserved-prefix route, so the UI can never shadow those.
+async fn static_fallback(State(state): State<AppState>, uri: Uri) -> Response {
+    let path = uri.path();
+    if path == "/health"
+        || path == "/api"
+        || path.starts_with("/api/")
+        || path == "/sonarr"
+        || path.starts_with("/sonarr/")
+        || path == "/radarr"
+        || path.starts_with("/radarr/")
+    {
+        return (StatusCode::NOT_FOUND, "").into_response();
+    }
+
+    let relative = path.trim_start_matches('/');
+    if relative.is_empty() {
+        return serve_index(&state).await;
+    }
+    if relative
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == ".." || part.contains('\\'))
+    {
+        return (StatusCode::BAD_REQUEST, "").into_response();
+    }
+
+    let candidate = state.config.admin_ui_dir.join(relative);
+    match tokio::fs::read(&candidate).await {
+        Ok(bytes) => file_response(relative, bytes),
+        Err(_) => serve_index(&state).await,
+    }
+}
+
+async fn serve_index(state: &AppState) -> Response {
+    let index = state.config.admin_ui_dir.join("index.html");
+    match tokio::fs::read(&index).await {
+        Ok(bytes) => file_response("index.html", bytes),
+        Err(_) => (StatusCode::NOT_FOUND, "").into_response(),
+    }
+}
+
+fn file_response(path: &str, bytes: Vec<u8>) -> Response {
+    let content_type = match path.rsplit('.').next().unwrap_or_default() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "ico" => "image/x-icon",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "txt" => "text/plain; charset=utf-8",
+        "gz" => "application/gzip",
+        _ => "application/octet-stream",
+    };
+    let mut response = bytes.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
 }
 
 async fn sonarr_prowlarr(

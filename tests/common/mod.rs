@@ -16,7 +16,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt;
 use jproxy_rs::app::{AppState, router as app_router};
@@ -548,6 +548,8 @@ impl TestEnv {
             sonarr_rename_fallback: Duration::from_secs(1800),
             radarr_rename_fallback: Duration::from_secs(1800),
             rename_file: false,
+            token_expires: Duration::from_secs(10080 * 60),
+            admin_ui_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("admin_dist"),
             login_enabled: false,
             sync_enabled: false,
             request_timeout: Duration::from_secs(5),
@@ -605,7 +607,22 @@ impl HttpResult {
 
 /// Issue a GET request through the router.
 pub async fn get(router: &Router, uri: &str) -> HttpResult {
-    let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    request(router, Method::GET, uri, &[], "").await
+}
+
+/// Issue a request with explicit headers and body through the router.
+pub async fn request(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> HttpResult {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(Body::from(body.to_owned())).unwrap();
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let headers = response.headers().clone();
@@ -615,4 +632,43 @@ pub async fn get(router: &Router, uri: &str) -> HttpResult {
         headers,
         body: String::from_utf8_lossy(&bytes).into_owned(),
     }
+}
+
+/// Issue an authenticated GET request.
+pub async fn get_auth(router: &Router, uri: &str, token: &str) -> HttpResult {
+    request(
+        router,
+        Method::GET,
+        uri,
+        &[("authorization", &format!("Bearer {token}"))],
+        "",
+    )
+    .await
+}
+
+/// Issue an authenticated JSON POST request.
+pub async fn post_json_auth(router: &Router, uri: &str, token: &str, body: &str) -> HttpResult {
+    request(
+        router,
+        Method::POST,
+        uri,
+        &[
+            ("authorization", &format!("Bearer {token}")),
+            ("content-type", "application/json"),
+        ],
+        body,
+    )
+    .await
+}
+
+/// Issue an unauthenticated JSON POST request.
+pub async fn post_json(router: &Router, uri: &str, body: &str) -> HttpResult {
+    request(
+        router,
+        Method::POST,
+        uri,
+        &[("content-type", "application/json")],
+        body,
+    )
+    .await
 }

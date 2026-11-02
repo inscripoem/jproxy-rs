@@ -4,10 +4,9 @@ A Rust implementation of the Phase 1 jproxy proxy between Sonarr/Radarr and
 Prowlarr/Jackett. It forwards Torznab requests, rewrites search queries using
 the existing `sonarr_title`, `radarr_title`, `sonarr_rule`, and `radarr_rule`
 tables, applies `MIN_COUNT` alternate-title retries, formats returned item
-titles with the configured rules, and caches upstream XML responses.
-
-Phase 1 intentionally has **no admin UI and no authentication**. Do not expose
-it to an untrusted network.
+titles with the configured rules, and caches upstream XML responses. It also
+serves the compiled Java admin UI and implements the admin REST API and
+Java-compatible login/JWT session handling.
 
 ## Status
 
@@ -43,6 +42,15 @@ Implemented:
 - Sonarr/Radarr history rename tasks, including `RENAME_FILE` file renaming for
   qBittorrent and the Java-compatible Transmission `torrent-rename-path` flow.
 - `GET /health` JSON endpoint.
+- Admin REST API for Sonarr/Radarr rules, titles and examples, TMDB titles,
+  rule testing, system configuration, system users and cache control.
+- Java-compatible login with an HS256 JWT, `LOGIN_ENABLED`, `TOKEN_EXPIRES`,
+  a global wrong-login limit, logout blacklisting, and `403` on protected admin
+  routes. The Torznab routes and `/health` remain public.
+- The compiled Vue admin UI from the Java project, served from `admin_dist/`
+  with SPA fallback and MIT attribution.
+- First-run `system_user` and `system_config` rows matching the upstream
+  Liquibase seed (`jproxy` / `jproxy@2023` through the UI).
 - Multi-stage Dockerfile.
 - Reference-data import from an existing `jproxy.db` (`jproxy-rs import`).
 - End-to-end parity harness against recorded Torznab XML fixtures.
@@ -51,12 +59,11 @@ Implemented:
 
 Not implemented (deferred Java behavior):
 
-- Admin UI, login, users, sessions, and `LOGIN_ENABLED` enforcement.
 - Downloader API proxying (the `/sonarr/qbittorrent`, `/sonarr/transmission`,
   and Radarr equivalents of the Java Charon routes). Login and rename use the
-  downloader APIs directly.
-- Example-table management and the Java cache/system-config REST APIs.
-- Java's admin cache controls and distributed/persistent caching.
+  downloader APIs directly. The Charon routes are inactive in the current Java
+  build as well: `pom.xml` has no Charon dependency and no route configuration.
+- Java's distributed/persistent caching and exact Caffeine eviction behaviour.
 
 ## Build and test
 
@@ -85,10 +92,12 @@ The test suite includes:
 - `tests/sync.rs` — title, TMDB, rule and on-demand synchronization against
   local mock Sonarr/Radarr/TMDB/rule endpoints;
 - `tests/upstream_errors.rs` — retry, concurrency and error-mapping tests;
+- `tests/admin.rs` — admin CRUD, login/JWT rejection, cache/config endpoints and
+  static UI serving with synthetic users only;
 - `tests/real_data.rs` — validation against data exported from a live jproxy.
 
 The release profile sets `opt-level = "z"`, thin LTO, one codegen unit and
-`strip = true`; the resulting binary is about 8.5 MB. Panic unwinding is left
+`strip = true`; the resulting binary is about 8.8 MB. Panic unwinding is left
 enabled so a handler panic cannot abort the whole process. See
 [Resource use](#resource-use) for measured RSS.
 
@@ -104,10 +113,12 @@ export SYNC_ENABLED=false
 target/release/jproxy-rs
 ```
 
-The service creates missing tables on startup. It does not copy users, API
-keys, or any other upstream `system_config` values. At runtime it reads only the
-whitelisted baseline keys described under Configuration; downloader credentials
-and `system_user` rows are never selected.
+The service creates missing tables and the upstream first-run seed rows on
+startup. It does not copy an operator's users, API keys, or configured values:
+the seed uses `INSERT OR IGNORE`, so an imported database is preserved. At
+runtime it reads only the whitelisted baseline keys described under
+Configuration and verifies admin logins against `system_user`; downloader
+credentials are held in memory and never logged.
 
 Torznab URLs to configure in Sonarr/Radarr:
 
@@ -199,9 +210,12 @@ keys listed below. Only the following `system_config` keys are read:
 `ruleLocation`, `ruleLocationBackup`, `qbittorrentUrl`, `qbittorrentUsername`,
 `qbittorrentPassword`, `transmissionUrl`, `transmissionUsername`,
 `transmissionPassword`. Downloader credentials are held in memory, used only
-for login, and are never logged or included in the startup summary;
-`system_user` rows are never selected. Values are resolved once at startup;
-restart the process after changing `system_config` or the environment.
+for login, and are never logged or included in the startup summary. The admin
+login reads `system_user` only to verify a submitted password; it never logs or
+returns stored hashes. Values are resolved once at startup; restart the process
+after changing `system_config` or the environment. The admin `config/update`
+endpoint persists rows immediately (so the UI reflects them) but runtime
+behaviour still uses the startup values until restart.
 
 All other settings remain environment-only.
 
@@ -244,7 +258,9 @@ All other settings remain environment-only.
 | `SONARR_RENAME_FALLBACK_MINS` | `30` | Sonarr history lookback window in minutes. |
 | `RADARR_RENAME_FALLBACK_MINS` | `30` | Radarr history lookback window in minutes. |
 | `RENAME_FILE` | `true` | Also rename files inside a qBittorrent torrent after the torrent rename succeeds. Transmission has no file-level rename. |
-| `LOGIN_ENABLED` | `false` | Parsed for deployment compatibility; this service has no auth. |
+| `LOGIN_ENABLED` | `false` | Require credentials for `/api/**` admin routes. When false, `/api/system/user/login` returns an Anonymous JWT; the UI still needs that token for admin calls. |
+| `TOKEN_EXPIRES` | `10080` | Admin JWT lifetime in minutes (seven days). |
+| `ADMIN_UI_DIR` | `admin_dist` | Directory containing the compiled admin UI (`index.html` and `assets/`). Missing files return 404; it is never fetched at runtime. |
 | `REQUEST_TIMEOUT_SECS` | `30` | Upstream and sync HTTP timeout. |
 | `RESULT_CACHE_MAX_ENTRIES` | `1000` | Maximum cached Torznab responses. |
 | `UPSTREAM_MAX_CONCURRENCY` | `8` | Maximum simultaneous upstream indexer requests. |
@@ -256,7 +272,56 @@ All other settings remain environment-only.
 on-demand synchronization. A missing Sonarr/Radarr URL or API key skips that
 kind. A missing Prowlarr/Jackett URL makes the related routes return HTTP 503.
 
-### Background schedule
+## Admin UI, API and authentication
+
+The compiled Vue admin UI from the MIT-licensed Java project is vendored in
+`admin_dist/` together with `admin_dist/LICENSE.txt`. It is served from disk at
+`/` with SPA fallback for client-side routes. `ADMIN_UI_DIR` selects the
+directory; the UI is never downloaded at runtime. Unknown `/api/**` paths,
+`/health`, and the Torznab proxy prefixes never fall through to the SPA.
+
+All admin endpoints use the Java paths, methods, camelCase JSON fields, and
+`current`/`pageSize` pagination:
+
+| Base path | Operations |
+| --- | --- |
+| `/api/sonarr/rule`, `/api/radarr/rule` | `POST sync`, `GET query`, `POST save`, `POST remove`, `POST enable`, `POST disable`, `POST export`, `POST import`, `GET token/list` |
+| `/api/sonarr/title`, `/api/radarr/title` | `POST sync`, `GET query`, `POST remove` |
+| `/api/sonarr/example`, `/api/radarr/example` | `POST save`, `GET query`, `POST remove` |
+| `/api/rule/test` | `GET` with `regex`, `replacement`, `offset`, `example` |
+| `/api/tmdb/title` | `POST sync`, `GET query`, `POST remove`, `POST save` |
+| `/api/system/config` | `GET version`, `GET query`, `POST update`, `GET author/list` |
+| `/api/system/user` | `POST login`, `POST logout`, `GET info`, `POST update`, `GET isLoginEnabled` |
+| `/api/system/cache` | `POST clear`, `POST clearAll` |
+
+Authentication follows the Java controller and interceptor:
+
+- Every `/api/**` route requires `Authorization: Bearer <jwt>` except
+  `/api/system/user/login` and `/api/system/user/isLoginEnabled`; missing or
+  invalid tokens return `403`. The Torznab proxy routes and `/health` stay
+  public.
+- `LOGIN_ENABLED=false` makes `login` return an Anonymous JWT; user `update`
+  then returns `401`. The UI still needs the token for admin calls.
+- The first-run seed creates `jproxy` / `jproxy@2023`, matching the upstream
+  documentation. The compiled UI sends the uppercase MD5 of the typed password,
+  and the service hashes the submitted value once. Direct API clients must
+  therefore POST the uppercase MD5, not the plaintext. For a synthetic password
+  `synthetic-password`, that value is the uppercase MD5 of
+  `synthetic-password`.
+- JWTs are HS256 with a random per-process secret. Claims are `id`, `username`,
+  `password`, `role`, `valid_status`, `exp`, and `iat`; `TOKEN_EXPIRES`
+  (minutes) controls expiry. Tokens become invalid after a process restart.
+  Logout blacklists the raw `Authorization` header. More than ten wrong logins
+  block login until restart, as in Java.
+- `/api/system/config/update` normalizes the Transmission URL, sets
+  `validStatus` for the known keys, and persists the rows. Validation is
+  syntactic and does not contact Sonarr/Radarr/TMDB/downloaders. Configuration
+  is applied to runtime behaviour at the next restart; the database and UI
+  reflect the update immediately. Values are never logged.
+- `/api/system/config/version` reports this service's version without the Java
+  GitHub release check.
+
+## Background schedule
 
 Titles synchronize hourly and rules daily, approximating the Java cron schedule
 from process start rather than at Java's fixed minutes. The first tick runs
@@ -467,20 +532,45 @@ The measured log contained none of the synthetic password, cookie, or API key
 values. The feature profile remains below both the 30–45 MB baseline target and
 the 100 MB full-parity target.
 
+### Admin UI/API profile
+
+Method: release binary, temporary SQLite database, `admin_dist/` served from
+disk, local mock Torznab upstream, `SYNC_ENABLED=false`, `MIN_COUNT=0`,
+`LOGIN_ENABLED=true`, and a synthetic admin user. The database was seeded with
+200 Sonarr titles, 200 Radarr titles, 200 rules, 100 examples, and 100 TMDB
+rows. Five `VmRSS` samples were taken 0.3 seconds apart per phase. The admin
+phase covered login, user info, config query, rule/title/example/TMDB queries,
+a rule save, the UI root and a JS asset, and cache clear-all. The load phase
+used 2,000 Torznab queries with concurrency 16 and 500 distinct `q` values.
+No live service or real credential was used.
+
+| Phase | Workload | RSS |
+| --- | --- | --- |
+| Idle, admin UI enabled | Seeded database, no admin or proxy requests | 10,468 KB (10.2 MB) |
+| After representative admin calls | Login, CRUD queries, formatting preview, static UI, cache clear | 13,184 KB (12.9 MB) |
+| Under proxy load | 2,000 queries, concurrency 16, 500 distinct `q` values | 20,532 KB (20.1 MB) |
+
+The samples were stable within each phase (`VmRSS` did not move during the
+sampling window). Values are current RSS, not peak `VmHWM`, with SQLite page
+cache and allocator retention included.
+
 ## SQLite compatibility
 
 The bundled `sqlx` SQLite build uses its own SQLite library. The schema in
 `migrations/0001_schema.sql` mirrors the final upstream Liquibase migrations,
-including the later `series_id` and `movie_id` columns. There is no Liquibase
-metadata table in this project, so an existing `jproxy.db` can be opened
-directly, but run it against a backup first. The service reads only the
-whitelisted `system_config` keys, never `system_user`, and never writes
-downloader credentials back to the database.
+including the later `series_id` and `movie_id` columns. `migrations/0002_admin_seed.sql`
+adds the upstream first-run `system_user` and `system_config` rows with
+`INSERT OR IGNORE`, so an imported database keeps its own users and settings.
+There is no Liquibase metadata table in this project, so an existing `jproxy.db`
+can be opened directly, but run it against a backup first. The service reads
+only the whitelisted `system_config` keys and verifies admin logins against
+`system_user`; it never writes downloader credentials back to the database.
 
 ## Docker
 
-The Dockerfile builds the release binary in a Rust stage and copies only the
-binary into a distroless runtime image.
+The Dockerfile builds the release binary in a Rust stage and copies the binary
+and `admin_dist/` into a distroless runtime image. The image sets
+`ADMIN_UI_DIR=/app/admin_dist`.
 
 ```sh
 docker build -t jproxy-rs .
@@ -583,11 +673,41 @@ mechanism rather than committing them.
 - **Response formatting always re-encodes changed titles.** Unchanged item
   titles, all other XML, and the XML declaration are preserved. A response is
   returned byte-for-byte when it has no applicable item title changes.
+- **Admin password contract.** The Java UI hashes the typed password with MD5
+  before login, and the service hashes the submitted value again. This
+  implementation preserves that contract, so non-UI API clients must send the
+  uppercase MD5 of the password. Passwords, password hashes, tokens, and
+  `system_config` values are never logged.
+- **Admin JWT secret lifetime.** Java generates a random secret per process, so
+  tokens die on restart; this implementation does the same. The logout
+  blacklist is process-local and is cleared by `cache/clearAll`, matching
+  Java's cache clear-all.
+- **Config validation is syntactic.** Java probes Sonarr/Radarr/TMDB and both
+  downloaders with live HTTP requests when `/api/system/config/update` runs.
+  This implementation validates URL shape, required format tokens, and regex
+  compilation without outbound calls, and marks downloader credentials valid
+  only when the URL and both credential fields are present. The UI status icons
+  can therefore differ from Java until a live login succeeds.
+- **Config updates need a restart.** `/api/system/config/update` writes the
+  database and clears caches/gates, but the proxy and sync tasks keep the
+  startup `Config` values. Java reloads them through its `system_config` cache.
+- **Admin version check.** `/api/system/config/version` reports the Rust
+  package version without calling GitHub.
+- **Admin UI delivery.** The compiled UI is vendored from the Java distribution
+  (MIT, see `admin_dist/LICENSE.txt`) and served from disk; it is not rebuilt or
+  downloaded at runtime. Unknown `/api/**` paths require authentication and
+  return `403` without a token, then `404`, matching the Java interceptor.
+- **Charon routes.** `/sonarr|radarr/qbittorrent|transmission` remain
+  unimplemented. They are also inactive in the current Java build (no Charon
+  dependency or route configuration), so no working Java endpoint is missing.
 
 ## Project layout
 
 ```text
-src/app.rs          Axum routes, proxy flow, health
+src/app.rs          Axum routes, proxy flow, health, static UI fallback
+src/admin.rs        Java-compatible admin REST handlers and validation
+src/admin_db.rs     admin SQLite queries and page types
+src/auth.rs         MD5 password contract, HS256 JWT, blacklist, middleware
 src/search.rs       alternate-title plan and MIN_COUNT retry executor
 src/rules.rs        priority-ordered compiled rules
 src/formatting.rs   Java-compatible item title formatting
@@ -601,8 +721,9 @@ src/sync.rs         Sonarr/Radarr title sync, TMDB sync, rule sync, on-demand
 src/upstream.rs     reqwest/rustls upstream client, retry and concurrency
 src/query.rs        lossless-enough query parameter editing and cache keys
 src/text.rs         Java FormatUtil ports
-migrations/         Java-compatible SQLite schema
+migrations/         Java-compatible SQLite schema and first-run admin seed
+admin_dist/         compiled Java admin UI with MIT license
 fixtures/           exported reference DB and synthetic Torznab XML
-tests/              parity, sync, downloader, rename and upstream-error tests
+tests/              parity, sync, downloader, rename, admin and upstream-error tests
 scripts/            fixture export, local run and Java/Rust comparison
 ```
