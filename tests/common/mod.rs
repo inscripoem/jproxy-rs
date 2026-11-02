@@ -16,7 +16,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
-use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt;
 use jproxy_rs::app::{AppState, router as app_router};
@@ -225,6 +225,211 @@ impl MockIndexer {
     }
 }
 
+/// A canned response for `MockHttp`.
+#[derive(Clone, Debug)]
+pub struct MockHttpReply {
+    pub status: u16,
+    pub body: String,
+    pub content_type: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl MockHttpReply {
+    pub fn status(status: u16) -> Self {
+        Self {
+            status,
+            body: String::new(),
+            content_type: "text/plain; charset=utf-8".to_owned(),
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn ok(body: impl Into<String>) -> Self {
+        Self {
+            status: 200,
+            body: body.into(),
+            content_type: "text/plain; charset=utf-8".to_owned(),
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn json(body: impl Into<String>) -> Self {
+        Self {
+            status: 200,
+            body: body.into(),
+            content_type: "application/json".to_owned(),
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn with_body(mut self, body: impl Into<String>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MockHttpRequest {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub headers: HeaderMap,
+    pub body: String,
+}
+
+impl MockHttpRequest {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    /// Decode an `application/x-www-form-urlencoded` request body.
+    pub fn form(&self) -> Vec<(String, String)> {
+        url::form_urlencoded::parse(self.body.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect()
+    }
+
+    pub fn form_value(&self, name: &str) -> Option<String> {
+        self.form()
+            .into_iter()
+            .find_map(|(key, value)| (key == name).then_some(value))
+    }
+}
+
+#[derive(Default)]
+struct HttpPlan {
+    routes: HashMap<(String, String), Vec<MockHttpReply>>,
+}
+
+struct HttpInner {
+    log: Mutex<Vec<MockHttpRequest>>,
+    plan: Mutex<HttpPlan>,
+}
+
+#[derive(Clone)]
+struct MockHttpState {
+    inner: Arc<HttpInner>,
+}
+
+/// A generic in-process HTTP mock for downloader and Sonarr/Radarr APIs.
+///
+/// Routes match on method and exact path. A single reply repeats; a sequence
+/// is consumed in order.
+pub struct MockHttp {
+    pub addr: SocketAddr,
+    state: MockHttpState,
+}
+
+impl MockHttp {
+    pub async fn start() -> Self {
+        let state = MockHttpState {
+            inner: Arc::new(HttpInner {
+                log: Mutex::new(Vec::new()),
+                plan: Mutex::new(HttpPlan::default()),
+            }),
+        };
+        let app = Router::new()
+            .fallback(handle_http)
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Self { addr, state }
+    }
+
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub fn route(&self, method: &str, path: &str, reply: MockHttpReply) {
+        self.state
+            .inner
+            .plan
+            .lock()
+            .unwrap()
+            .routes
+            .insert((method.to_owned(), path.to_owned()), vec![reply]);
+    }
+
+    pub fn route_sequence(&self, method: &str, path: &str, replies: Vec<MockHttpReply>) {
+        assert!(!replies.is_empty(), "a route sequence needs one reply");
+        self.state
+            .inner
+            .plan
+            .lock()
+            .unwrap()
+            .routes
+            .insert((method.to_owned(), path.to_owned()), replies);
+    }
+
+    pub fn requests(&self) -> Vec<MockHttpRequest> {
+        self.state.inner.log.lock().unwrap().clone()
+    }
+
+    pub fn requests_for(&self, method: &str, path: &str) -> Vec<MockHttpRequest> {
+        self.requests()
+            .into_iter()
+            .filter(|request| request.method == method && request.path == path)
+            .collect()
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.state.inner.log.lock().unwrap().len()
+    }
+}
+
+async fn handle_http(State(state): State<MockHttpState>, request: Request<Body>) -> Response {
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+    let query = request.uri().query().unwrap_or_default().to_owned();
+    let headers = request.headers().clone();
+    let body = request
+        .into_body()
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    state.inner.log.lock().unwrap().push(MockHttpRequest {
+        method: method.clone(),
+        path: path.clone(),
+        query,
+        headers,
+        body,
+    });
+
+    let reply = {
+        let mut plan = state.inner.plan.lock().unwrap();
+        match plan.routes.get_mut(&(method, path)) {
+            Some(replies) if replies.len() > 1 => replies.remove(0),
+            Some(replies) => replies[0].clone(),
+            None => MockHttpReply::status(404),
+        }
+    };
+
+    let status = StatusCode::from_u16(reply.status).unwrap();
+    let mut result = (status, reply.body).into_response();
+    if let Ok(value) = HeaderValue::from_str(&reply.content_type) {
+        result.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    for (name, value) in reply.headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            result.headers_mut().insert(name, value);
+        }
+    }
+    result
+}
+
 async fn handle(State(state): State<MockState>, uri: Uri, RawQuery(query): RawQuery) -> Response {
     let query = query.unwrap_or_default();
     let path = uri.path().to_owned();
@@ -324,6 +529,12 @@ impl TestEnv {
             rule_location: None,
             rule_location_backup: None,
             rule_sync_authors: None,
+            qbittorrent_url: None,
+            qbittorrent_username: None,
+            qbittorrent_password: None,
+            transmission_url: None,
+            transmission_username: None,
+            transmission_password: None,
             clean_title_regex: DEFAULT_CLEAN_TITLE_REGEX.to_owned(),
             sonarr_indexer_format: DEFAULT_SONARR_FORMAT.to_owned(),
             radarr_indexer_format: DEFAULT_RADARR_FORMAT.to_owned(),
@@ -331,6 +542,11 @@ impl TestEnv {
             cache_expires: Duration::from_secs(60),
             sync_interval: Duration::ZERO,
             indexer_result_cache_expires: Duration::from_secs(15),
+            downloader_login_interval: Duration::from_secs(1800),
+            sonarr_rename_interval: Duration::from_secs(30),
+            radarr_rename_interval: Duration::from_secs(60),
+            sonarr_rename_fallback: Duration::from_secs(1800),
+            radarr_rename_fallback: Duration::from_secs(1800),
             rename_file: false,
             login_enabled: false,
             sync_enabled: false,

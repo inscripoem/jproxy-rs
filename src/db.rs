@@ -53,12 +53,13 @@ pub async fn healthcheck(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-/// Load only the whitelisted baseline `system_config` rows.
+/// Load the whitelisted `system_config` rows.
 ///
-/// Downloader credentials and user rows are never selected. Values are kept in
-/// memory and are not logged by the caller.
+/// Downloader credentials are selected only so the login tasks can use them.
+/// Values are kept in memory and are not logged by the caller. `system_user`
+/// rows are never selected.
 pub async fn load_system_config_values(pool: &SqlitePool) -> Result<SystemConfigValues> {
-    let keys = crate::config::Config::baseline_system_config_keys();
+    let keys = crate::config::Config::system_config_keys();
     let placeholders = vec!["?"; keys.len()].join(",");
     let sql = format!(
         "SELECT \"key\", value FROM system_config \
@@ -385,14 +386,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_config_loader_reads_only_baseline_keys() {
+    async fn system_config_loader_reads_only_whitelisted_keys() {
         let pool = connect_memory().await.unwrap();
         sqlx::query(
             "INSERT INTO system_config (\"key\", value, valid_status) VALUES \
              ('sonarrUrl', 'http://synthetic.invalid', 1), \
              ('sonarrApikey', 'synthetic-key', 1), \
              ('ruleSyncAuthors', 'alice', 1), \
-             ('qbittorrentPassword', 'must-not-be-read', 1), \
+             ('qbittorrentPassword', 'synthetic-downloader-password', 1), \
+             ('unlistedKey', 'must-not-be-read', 1), \
              ('tmdbApikey', 'ignored-invalid-row', 0)",
         )
         .execute(&pool)
@@ -403,7 +405,11 @@ mod tests {
         assert_eq!(values.get("sonarrUrl"), Some("http://synthetic.invalid"));
         assert_eq!(values.get("sonarrApikey"), Some("synthetic-key"));
         assert_eq!(values.get("ruleSyncAuthors"), Some("alice"));
-        assert_eq!(values.get("qbittorrentPassword"), None);
+        assert_eq!(
+            values.get("qbittorrentPassword"),
+            Some("synthetic-downloader-password")
+        );
+        assert_eq!(values.get("unlistedKey"), None);
         assert_eq!(values.get("tmdbApikey"), None);
     }
 

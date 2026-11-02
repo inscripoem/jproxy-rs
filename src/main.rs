@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use jproxy_rs::app::{self, AppState};
 use jproxy_rs::config::Config;
 use jproxy_rs::import;
+use jproxy_rs::rename;
 use jproxy_rs::sync;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -24,6 +25,7 @@ async fn main() -> Result<()> {
     let state = AppState::new(config).await?;
     info!("{}", state.config.startup_summary());
     sync::spawn(state.clone());
+    rename::spawn(state.clone());
 
     let listen_addr = state.config.listen_addr;
     let listener = TcpListener::bind(listen_addr).await?;

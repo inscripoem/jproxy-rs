@@ -24,12 +24,12 @@ pub const DEFAULT_SONARR_LANGUAGE_1: &str = "zh-CN";
 pub const DEFAULT_SONARR_LANGUAGE_2: &str = "zh-TW";
 pub const DEFAULT_RULE_SYNC_AUTHORS: &str = "ALL";
 
-/// The baseline `system_config` keys this service is allowed to read.
+/// The `system_config` keys this service is allowed to read.
 ///
-/// Downloader credentials and user rows are deliberately excluded. Values are
-/// held in memory only and are never logged; environment variables take
-/// precedence over these rows.
-const BASELINE_SYSTEM_CONFIG_KEYS: &[&str] = &[
+/// Downloader credentials are read only to log in; values are held in memory
+/// and are never logged. Environment variables take precedence over these rows.
+/// `system_user` rows are never selected.
+const SYSTEM_CONFIG_KEYS: &[&str] = &[
     "sonarrUrl",
     "sonarrApikey",
     "radarrUrl",
@@ -41,6 +41,12 @@ const BASELINE_SYSTEM_CONFIG_KEYS: &[&str] = &[
     "ruleSyncAuthors",
     "ruleLocation",
     "ruleLocationBackup",
+    "qbittorrentUrl",
+    "qbittorrentUsername",
+    "qbittorrentPassword",
+    "transmissionUrl",
+    "transmissionUsername",
+    "transmissionPassword",
 ];
 
 #[derive(Clone, Default)]
@@ -75,6 +81,15 @@ pub struct Config {
     pub rule_location: Option<String>,
     pub rule_location_backup: Option<String>,
     pub rule_sync_authors: Option<String>,
+    /// Downloader endpoints and credentials. Credentials are runtime-only and
+    /// must never be logged. A blank username or password is preserved because
+    /// some downloader accounts intentionally have no password.
+    pub qbittorrent_url: Option<String>,
+    pub qbittorrent_username: Option<String>,
+    pub qbittorrent_password: Option<String>,
+    pub transmission_url: Option<String>,
+    pub transmission_username: Option<String>,
+    pub transmission_password: Option<String>,
     pub clean_title_regex: String,
     pub sonarr_indexer_format: String,
     pub radarr_indexer_format: String,
@@ -85,7 +100,18 @@ pub struct Config {
     /// Sync period. Zero disables the background task and on-demand sync.
     pub sync_interval: Duration,
     pub indexer_result_cache_expires: Duration,
-    /// Parsed for compatibility with the Java deployment. Phase 1 has no renamer.
+    /// Java `time.downloader-login` runs every 30 minutes. Zero disables the
+    /// scheduled re-login; the startup login still runs.
+    pub downloader_login_interval: Duration,
+    /// Java `time.sonarr-rename` runs every 30 seconds. Zero disables the task.
+    pub sonarr_rename_interval: Duration,
+    /// Java `time.radarr-rename` runs every minute. Zero disables the task.
+    pub radarr_rename_interval: Duration,
+    /// Java `time.sonarr-rename-fall-back`, in minutes.
+    pub sonarr_rename_fallback: Duration,
+    /// Java `time.radarr-rename-fall-back`, in minutes.
+    pub radarr_rename_fallback: Duration,
+    /// Java `rename.file`: also rename the files inside each torrent.
     pub rename_file: bool,
     /// Parsed for compatibility with the Java deployment. Phase 1 has no auth.
     pub login_enabled: bool,
@@ -137,6 +163,12 @@ impl Config {
             rule_location_backup: env_raw("RULE_LOCATION_BACKUP")
                 .map(|value| value.trim().to_owned()),
             rule_sync_authors: env_raw("RULE_SYNC_AUTHORS").map(|value| value.trim().to_owned()),
+            qbittorrent_url: env_string("QBITTORRENT_URL"),
+            qbittorrent_username: env_secret("QBITTORRENT_USERNAME"),
+            qbittorrent_password: env_secret("QBITTORRENT_PASSWORD"),
+            transmission_url: env_string("TRANSMISSION_URL"),
+            transmission_username: env_secret("TRANSMISSION_USERNAME"),
+            transmission_password: env_secret("TRANSMISSION_PASSWORD"),
             clean_title_regex: env_string("CLEAN_TITLE_REGEX")
                 .unwrap_or_else(|| DEFAULT_CLEAN_TITLE_REGEX.to_owned()),
             sonarr_indexer_format: env_string("SONARR_INDEXER_FORMAT")
@@ -147,6 +179,24 @@ impl Config {
             cache_expires,
             sync_interval,
             indexer_result_cache_expires,
+            downloader_login_interval: Duration::from_secs(env_u64(
+                "DOWNLOADER_LOGIN_INTERVAL_SECS",
+                30 * 60,
+            )?),
+            sonarr_rename_interval: Duration::from_secs(env_u64(
+                "SONARR_RENAME_INTERVAL_SECS",
+                30,
+            )?),
+            radarr_rename_interval: Duration::from_secs(env_u64(
+                "RADARR_RENAME_INTERVAL_SECS",
+                60,
+            )?),
+            sonarr_rename_fallback: Duration::from_secs(
+                env_minutes("SONARR_RENAME_FALLBACK_MINS", 30)?.saturating_mul(60),
+            ),
+            radarr_rename_fallback: Duration::from_secs(
+                env_minutes("RADARR_RENAME_FALLBACK_MINS", 30)?.saturating_mul(60),
+            ),
             rename_file: env_bool("RENAME_FILE", true)?,
             login_enabled: env_bool("LOGIN_ENABLED", false)?,
             sync_enabled,
@@ -183,10 +233,46 @@ impl Config {
         if self.rule_location_backup.is_none() {
             self.rule_location_backup = values.get("ruleLocationBackup").map(str::to_owned);
         }
+        fill_raw_optional(&mut self.qbittorrent_url, values.get("qbittorrentUrl"));
+        fill_raw_optional(
+            &mut self.qbittorrent_username,
+            values.get("qbittorrentUsername"),
+        );
+        fill_raw_optional(
+            &mut self.qbittorrent_password,
+            values.get("qbittorrentPassword"),
+        );
+        fill_raw_optional(&mut self.transmission_url, values.get("transmissionUrl"));
+        fill_raw_optional(
+            &mut self.transmission_username,
+            values.get("transmissionUsername"),
+        );
+        fill_raw_optional(
+            &mut self.transmission_password,
+            values.get("transmissionPassword"),
+        );
     }
 
-    pub fn baseline_system_config_keys() -> &'static [&'static str] {
-        BASELINE_SYSTEM_CONFIG_KEYS
+    pub fn system_config_keys() -> &'static [&'static str] {
+        SYSTEM_CONFIG_KEYS
+    }
+
+    /// Whether enough values exist to attempt a qBittorrent login. A blank
+    /// password is valid and is reported as configured.
+    pub fn qbittorrent_configured(&self) -> bool {
+        non_blank(self.qbittorrent_url.as_deref()).is_some()
+            && self.qbittorrent_username.is_some()
+            && self.qbittorrent_password.is_some()
+    }
+
+    pub fn transmission_configured(&self) -> bool {
+        non_blank(self.transmission_url.as_deref()).is_some()
+            && self.transmission_username.is_some()
+            && self.transmission_password.is_some()
+    }
+
+    pub fn downloaders_configured(&self) -> bool {
+        self.qbittorrent_configured() || self.transmission_configured()
     }
 
     pub fn tmdb_url(&self) -> &str {
@@ -242,7 +328,7 @@ impl Config {
     /// lists, or rule locations.
     pub fn startup_summary(&self) -> String {
         format!(
-            "listen={} database={} min_count={} sync_enabled={} sync_interval={}s cache_ttl={}s result_cache_ttl={}s cache_max_entries={} rename_file={} login_enabled={} sonarr_sync={} radarr_sync={} tmdb_sync={} rule_sync={} languages={},{} ondemand_timeout={}s upstream_concurrency={} upstream_retries={}",
+            "listen={} database={} min_count={} sync_enabled={} sync_interval={}s cache_ttl={}s result_cache_ttl={}s cache_max_entries={} rename_file={} rename_enabled={} login_enabled={} sonarr_sync={} radarr_sync={} tmdb_sync={} rule_sync={} qbittorrent={} transmission={} login_interval={}s sonarr_rename_interval={}s radarr_rename_interval={}s sonarr_rename_fallback={}s radarr_rename_fallback={}s languages={},{} ondemand_timeout={}s upstream_concurrency={} upstream_retries={}",
             self.listen_addr,
             self.database_path.display(),
             self.min_count,
@@ -252,11 +338,19 @@ impl Config {
             self.indexer_result_cache_expires.as_secs(),
             self.cache_max_entries,
             self.rename_file,
+            !self.sonarr_rename_interval.is_zero() || !self.radarr_rename_interval.is_zero(),
             self.login_enabled,
             self.title_sync_configured(AppKind::Sonarr),
             self.title_sync_configured(AppKind::Radarr),
             self.tmdb_api_key.is_some(),
             !self.rule_locations().is_empty(),
+            self.qbittorrent_configured(),
+            self.transmission_configured(),
+            self.downloader_login_interval.as_secs(),
+            self.sonarr_rename_interval.as_secs(),
+            self.radarr_rename_interval.as_secs(),
+            self.sonarr_rename_fallback.as_secs(),
+            self.radarr_rename_fallback.as_secs(),
             self.sonarr_languages()[0],
             self.sonarr_languages()[1],
             self.on_demand_sync_timeout.as_secs(),
@@ -275,6 +369,16 @@ fn fill_optional(target: &mut Option<String>, value: Option<&str>) {
     }
 }
 
+/// Fill a credential without trimming. A present but empty `system_config`
+/// value is preserved because a blank downloader password is valid.
+fn fill_raw_optional(target: &mut Option<String>, value: Option<&str>) {
+    if target.is_none()
+        && let Some(value) = value
+    {
+        *target = Some(value.to_owned());
+    }
+}
+
 fn non_blank(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -283,6 +387,12 @@ fn env_string(name: &str) -> Option<String> {
     env_raw(name)
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+/// Credential lookup that preserves an explicitly empty value. An unset
+/// variable still means "not configured".
+fn env_secret(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 /// Raw environment lookup. Unlike `env_string`, an explicitly empty value is
@@ -346,6 +456,12 @@ mod tests {
             rule_location: None,
             rule_location_backup: None,
             rule_sync_authors: None,
+            qbittorrent_url: None,
+            qbittorrent_username: None,
+            qbittorrent_password: None,
+            transmission_url: None,
+            transmission_username: None,
+            transmission_password: None,
             clean_title_regex: DEFAULT_CLEAN_TITLE_REGEX.to_owned(),
             sonarr_indexer_format: DEFAULT_SONARR_FORMAT.to_owned(),
             radarr_indexer_format: DEFAULT_RADARR_FORMAT.to_owned(),
@@ -353,6 +469,11 @@ mod tests {
             cache_expires: Duration::from_secs(60),
             sync_interval: Duration::from_secs(60),
             indexer_result_cache_expires: Duration::from_secs(15),
+            downloader_login_interval: Duration::from_secs(1800),
+            sonarr_rename_interval: Duration::from_secs(30),
+            radarr_rename_interval: Duration::from_secs(60),
+            sonarr_rename_fallback: Duration::from_secs(1800),
+            radarr_rename_fallback: Duration::from_secs(1800),
             rename_file: false,
             login_enabled: false,
             sync_enabled: true,
@@ -375,6 +496,18 @@ mod tests {
             ("sonarrLanguage1".to_owned(), "ja-JP".to_owned()),
             ("ruleSyncAuthors".to_owned(), "alice,bob".to_owned()),
             ("ruleLocation".to_owned(), "http://rules.invalid".to_owned()),
+            (
+                "qbittorrentUrl".to_owned(),
+                "http://qbittorrent.invalid".to_owned(),
+            ),
+            ("qbittorrentUsername".to_owned(), "db-user".to_owned()),
+            ("qbittorrentPassword".to_owned(), "db-pass".to_owned()),
+            (
+                "transmissionUrl".to_owned(),
+                "http://transmission.invalid".to_owned(),
+            ),
+            ("transmissionUsername".to_owned(), "db-user".to_owned()),
+            ("transmissionPassword".to_owned(), "db-pass".to_owned()),
         ]));
         config.apply_system_config(&values);
 
@@ -383,6 +516,13 @@ mod tests {
         assert_eq!(config.sonarr_languages()[0], "ja-JP");
         assert_eq!(config.sonarr_languages()[1], "zh-TW");
         assert_eq!(config.rule_sync_authors(), "alice,bob");
+        assert_eq!(
+            config.qbittorrent_password.as_deref(),
+            Some("db-pass"),
+            "downloader credentials are loaded from system_config"
+        );
+        assert!(config.qbittorrent_configured());
+        assert!(config.transmission_configured());
         assert_eq!(
             config.rule_locations(),
             vec![
@@ -411,6 +551,12 @@ mod tests {
         config.tmdb_api_key = Some("tmdb-secret".to_owned());
         config.rule_location = Some("http://rules.invalid".to_owned());
         config.rule_sync_authors = Some("private-author".to_owned());
+        config.qbittorrent_url = Some("http://qbittorrent.invalid".to_owned());
+        config.qbittorrent_username = Some("qb-user".to_owned());
+        config.qbittorrent_password = Some("qb-password".to_owned());
+        config.transmission_url = Some("http://transmission.invalid".to_owned());
+        config.transmission_username = Some("tr-user".to_owned());
+        config.transmission_password = Some("tr-password".to_owned());
         let summary = config.startup_summary();
         for secret in [
             "super-secret",
@@ -418,6 +564,12 @@ mod tests {
             "sonarr.invalid",
             "rules.invalid",
             "private-author",
+            "qbittorrent.invalid",
+            "transmission.invalid",
+            "qb-user",
+            "qb-password",
+            "tr-user",
+            "tr-password",
         ] {
             assert!(!summary.contains(secret), "summary leaked {secret}");
         }

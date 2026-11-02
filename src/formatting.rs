@@ -220,6 +220,64 @@ impl FormattingData {
     }
 }
 
+/// Token formatter used by the rename tasks.
+///
+/// This is the Java `sonarrTitleService.format` / `radarrTitleService.format`
+/// path: iterate the tokens present in the format string, apply the first rule
+/// for each token whose regex matches the text, then remove any unresolved
+/// tokens. Sonarr additionally returns the original text when `{episode}`
+/// could not be resolved.
+#[derive(Debug, Clone)]
+pub struct RenameFormatter {
+    rules: RuleSet,
+}
+
+impl RenameFormatter {
+    pub async fn load(pool: &SqlitePool, kind: AppKind, tokens: &[&str]) -> Result<Self> {
+        let rules = db::load_rules(pool, kind).await?;
+        let tokens: Vec<String> = tokens.iter().map(|token| (*token).to_owned()).collect();
+        Ok(Self {
+            rules: RuleSet::new(rules, &tokens),
+        })
+    }
+
+    /// `apply_offset` matches Java: Sonarr's `format` applies the rule offset,
+    /// Radarr's does not.
+    pub fn format(
+        &self,
+        text: &str,
+        format: &str,
+        episode_fallback: bool,
+        apply_offset: bool,
+    ) -> String {
+        let mut output = format.to_owned();
+        for token in token_names(format) {
+            for prepared in self.rules.token_rules(&token) {
+                let Some(regex) = &prepared.regex else {
+                    continue;
+                };
+                if !regex.is_match(text) {
+                    continue;
+                }
+                let value = regex
+                    .replace_all(text, prepared.rule.replacement.as_str())
+                    .into_owned();
+                let value = if apply_offset {
+                    execute_offset(&value, prepared.rule.offset)
+                } else {
+                    value
+                };
+                output = replace_token(&token, &value, &output);
+                break;
+            }
+        }
+        if episode_fallback && output.contains("{episode}") {
+            return text.to_owned();
+        }
+        remove_all_tokens(&output).trim().to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

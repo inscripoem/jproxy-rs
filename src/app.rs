@@ -15,6 +15,7 @@ use tower_http::trace::TraceLayer;
 use crate::cache::{Expiry, TtlCache};
 use crate::config::Config;
 use crate::db;
+use crate::downloader::Downloaders;
 use crate::formatting::FormattingData;
 use crate::models::{AppKind, MatchedTitle, Provider};
 use crate::query::QueryParams;
@@ -29,6 +30,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub pool: SqlitePool,
     pub upstream: UpstreamClient,
+    pub downloaders: Downloaders,
     pub result_cache: Arc<TtlCache<Arc<CachedBody>>>,
     pub formatting_cache: Arc<TtlCache<Option<Arc<FormattingData>>>>,
     pub title_cache: Arc<TtlCache<TitleLookup>>,
@@ -69,6 +71,7 @@ impl AppState {
             config.upstream_retry,
             config.upstream_max_concurrency,
         )?;
+        let downloaders = Downloaders::new(upstream.http_client().clone());
         let result_cache = Arc::new(TtlCache::with_expiry(
             config.indexer_result_cache_expires,
             config.result_cache_max_entries,
@@ -88,6 +91,7 @@ impl AppState {
             config: Arc::new(config),
             pool,
             upstream,
+            downloaders,
             result_cache,
             formatting_cache,
             title_cache,

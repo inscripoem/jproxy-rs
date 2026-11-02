@@ -35,8 +35,13 @@ Implemented:
   fallback and per-author error isolation.
 - Baseline `system_config` keys (`sonarrUrl`, `sonarrApikey`, `radarrUrl`,
   `radarrApikey`, `tmdbUrl`, `tmdbApikey`, `sonarrLanguage1`,
-  `sonarrLanguage2`, `ruleSyncAuthors`) with environment override. Downloader
-  credentials are never read.
+  `sonarrLanguage2`, `ruleSyncAuthors`) with environment override, plus the
+  downloader keys described below. Downloader credentials are read only to log
+  in and are never logged.
+- qBittorrent and Transmission login with scheduled session refresh. Both
+  failures and successes are logged without credentials or session values.
+- Sonarr/Radarr history rename tasks, including `RENAME_FILE` file renaming for
+  qBittorrent and the Java-compatible Transmission `torrent-rename-path` flow.
 - `GET /health` JSON endpoint.
 - Multi-stage Dockerfile.
 - Reference-data import from an existing `jproxy.db` (`jproxy-rs import`).
@@ -47,8 +52,9 @@ Implemented:
 Not implemented (deferred Java behavior):
 
 - Admin UI, login, users, sessions, and `LOGIN_ENABLED` enforcement.
-- File renaming for qBittorrent/Transmission and `RENAME_FILE` behavior.
-- Downloader login tasks and downloader API proxying.
+- Downloader API proxying (the `/sonarr/qbittorrent`, `/sonarr/transmission`,
+  and Radarr equivalents of the Java Charon routes). Login and rename use the
+  downloader APIs directly.
 - Example-table management and the Java cache/system-config REST APIs.
 - Java's admin cache controls and distributed/persistent caching.
 
@@ -187,12 +193,14 @@ for each query, and exits non-zero when any query differs. Without
 ## Configuration
 
 Precedence is **environment > `system_config` > built-in default** for the
-baseline keys listed below. Only the following `system_config` keys are read:
+keys listed below. Only the following `system_config` keys are read:
 `sonarrUrl`, `sonarrApikey`, `radarrUrl`, `radarrApikey`, `tmdbUrl`,
 `tmdbApikey`, `sonarrLanguage1`, `sonarrLanguage2`, `ruleSyncAuthors`,
-`ruleLocation`, `ruleLocationBackup`. Downloader credentials and `system_user`
-rows are never selected. Values are never logged; the startup summary reports
-only booleans, intervals, and sizes. Values are resolved once at startup;
+`ruleLocation`, `ruleLocationBackup`, `qbittorrentUrl`, `qbittorrentUsername`,
+`qbittorrentPassword`, `transmissionUrl`, `transmissionUsername`,
+`transmissionPassword`. Downloader credentials are held in memory, used only
+for login, and are never logged or included in the startup summary;
+`system_user` rows are never selected. Values are resolved once at startup;
 restart the process after changing `system_config` or the environment.
 
 All other settings remain environment-only.
@@ -224,8 +232,19 @@ All other settings remain environment-only.
 | `SYNC_INTERVAL` | `3` | Minutes for the title/on-demand sync gate. `0` disables sync. |
 | `SYNC_ENABLED` | `true` | Set `false` to disable background and on-demand sync. |
 | `ONDEMAND_SYNC_TIMEOUT_SECS` | `30` | Upper bound for one on-demand sync attempt. |
-| `RENAME_FILE` | `true` | Parsed for deployment compatibility; this baseline ignores it. |
-| `LOGIN_ENABLED` | `false` | Parsed for deployment compatibility; this baseline has no auth. |
+| `QBITTORRENT_URL` | `system_config.qbittorrentUrl` | qBittorrent base URL. The client appends `/api/v2/...`. |
+| `QBITTORRENT_USERNAME` | `system_config.qbittorrentUsername` | qBittorrent username. Never logged. |
+| `QBITTORRENT_PASSWORD` | `system_config.qbittorrentPassword` | qBittorrent password (blank allowed). Never logged. |
+| `TRANSMISSION_URL` | `system_config.transmissionUrl` | Full Transmission JSON-RPC URL, normally `http://host:9091/transmission/rpc`. |
+| `TRANSMISSION_USERNAME` | `system_config.transmissionUsername` | Transmission username. Never logged. |
+| `TRANSMISSION_PASSWORD` | `system_config.transmissionPassword` | Transmission password (blank allowed). Never logged. |
+| `DOWNLOADER_LOGIN_INTERVAL_SECS` | `1800` | Seconds between scheduled re-logins (Java runs every 30 minutes). `0` keeps the startup login only. |
+| `SONARR_RENAME_INTERVAL_SECS` | `30` | Seconds between Sonarr rename passes (Java cron `0/30 * * * * ?`). `0` disables the task. |
+| `RADARR_RENAME_INTERVAL_SECS` | `60` | Seconds between Radarr rename passes (Java cron `0 0/1 * * * ?`). `0` disables the task. |
+| `SONARR_RENAME_FALLBACK_MINS` | `30` | Sonarr history lookback window in minutes. |
+| `RADARR_RENAME_FALLBACK_MINS` | `30` | Radarr history lookback window in minutes. |
+| `RENAME_FILE` | `true` | Also rename files inside a qBittorrent torrent after the torrent rename succeeds. Transmission has no file-level rename. |
+| `LOGIN_ENABLED` | `false` | Parsed for deployment compatibility; this service has no auth. |
 | `REQUEST_TIMEOUT_SECS` | `30` | Upstream and sync HTTP timeout. |
 | `RESULT_CACHE_MAX_ENTRIES` | `1000` | Maximum cached Torznab responses. |
 | `UPSTREAM_MAX_CONCURRENCY` | `8` | Maximum simultaneous upstream indexer requests. |
@@ -244,6 +263,62 @@ from process start rather than at Java's fixed minutes. The first tick runs
 immediately. The `SYNC_INTERVAL` gate limits title synchronization (background
 and on-demand) to one attempt per interval; it does not make rules refresh every
 three minutes. `SYNC_INTERVAL` defaults to 3, matching Java's Caffeine gate.
+
+Downloader login runs once at startup, like Java's `CommandLineRunner`, then
+every `DOWNLOADER_LOGIN_INTERVAL_SECS` (30 minutes by default). Sonarr rename
+runs every 30 seconds and Radarr rename every minute, matching the Java cron
+entries; like a cron entry, neither rename task fires at process start. All
+three schedules start counting from process start rather than at fixed wall
+clock seconds.
+
+### Downloader login
+
+The service logs in to every downloader that has a URL, username, and password
+configured. Credentials come from the environment first, then `system_config`,
+and remain in memory only.
+
+- **qBittorrent**: `POST {QBITTORRENT_URL}/api/v2/auth/login` with a form body.
+  A 2xx response with a non-blank `Set-Cookie` header establishes the session.
+  The cookie is sent verbatim as the `Cookie` header on later calls. The login
+  response body is not inspected, matching Java.
+- **Transmission**: `POST {TRANSMISSION_URL}` with a JSON-RPC `session-get` and
+  HTTP Basic authentication. A `409 Conflict` carrying
+  `X-Transmission-Session-Id` establishes the session. Any later 409 triggers
+  one re-login and one retry.
+
+A login failure is non-fatal: it is logged at debug level with no credential or
+session value, and the next scheduled pass retries. If the process starts while
+a downloader is unavailable, proxy traffic is unaffected.
+
+### Rename tasks
+
+Both tasks follow Java's history flow:
+
+1. Return immediately unless at least one downloader is logged in.
+2. Fetch `GET {sonarr|radarr}/api/v3/history/since?eventType=1&date=...&apikey=...`
+   with `date` set to now minus the configured fallback window in UTC
+   (`yyyy-MM-dd'T'HH:mm:ss.SSS'Z'`).
+3. Read `sourceTitle`, `downloadId` (lowercased when non-blank), and
+   `data.torrentInfoHash`/`data.downloadClient`. Sonarr deduplicates records by
+   torrent hash; Radarr processes every record.
+4. Send the rename to Transmission when `downloadClient` is `Transmission`
+   (case-insensitive); otherwise use qBittorrent.
+5. When `RENAME_FILE=true` and the qBittorrent torrent rename succeeded, list
+   the torrent files (`/api/v2/torrents/files`) and rename each one through
+   `/api/v2/torrents/renameFile`.
+
+Sonarr file names are formatted from the existing `season` and `episode` rules
+(priority order, offset applied) with the Java token fallback; a file whose name
+does not resolve to `SxxExx`/`Exx` keeps its original name. Radarr file names
+become the source title. Subtitle extensions are numbered `.1.srt`, `.2.srt`,
+and so on, as in Java. A failure for one history item or one file is logged and
+isolated; remaining items still run. The tasks never delete media or touch the
+filesystem directly.
+
+Transmission renames preserve the existing extension, replace `:` with `_`, and
+skip the RPC when the name is unchanged, the torrent name is unavailable, or
+the name equals the torrent hash. Transmission exposes no file-level rename in
+Java, so `RENAME_FILE` applies only to qBittorrent.
 
 ### Rule synchronization
 
@@ -375,6 +450,23 @@ the number. The numbers are current `VmRSS`, not peak `VmHWM`; SQLite page cache
 and allocator retention are included. The mocks and data are local and
 synthetic; no live service or credential was used.
 
+Downloader login and rename add one qBittorrent session, one Transmission
+session, and the rename workers. Measured with the release binary, a temporary
+SQLite database, and local mock Sonarr/qBittorrent/Torznab endpoints. Both
+downloaders were configured; the measurement used synthetic credentials and the
+Sonarr rename interval was shortened to 10 seconds so a pass could be observed.
+RSS is `VmRSS`, median of three independent runs, five samples per run.
+
+| Phase | Workload | RSS |
+| --- | --- | --- |
+| Idle with downloaders configured | Initial qBittorrent login complete, no rename pass yet, no queries | 9.8 MB (10,028–10,300 KB) |
+| After one login/rename pass | qBittorrent login, Sonarr history, torrent rename, one file rename | 10.3 MB (10,572–10,848 KB) |
+| Under proxy load | 2,000 Torznab queries, 16 concurrent, 500 distinct `q` values, 500 cached results | 13.9 MB (14,140–14,596 KB) |
+
+The measured log contained none of the synthetic password, cookie, or API key
+values. The feature profile remains below both the 30–45 MB baseline target and
+the 100 MB full-parity target.
+
 ## SQLite compatibility
 
 The bundled `sqlx` SQLite build uses its own SQLite library. The schema in
@@ -382,8 +474,8 @@ The bundled `sqlx` SQLite build uses its own SQLite library. The schema in
 including the later `series_id` and `movie_id` columns. There is no Liquibase
 metadata table in this project, so an existing `jproxy.db` can be opened
 directly, but run it against a backup first. The service reads only the
-whitelisted baseline `system_config` keys and never reads `system_user` or
-downloader credentials.
+whitelisted `system_config` keys, never `system_user`, and never writes
+downloader credentials back to the database.
 
 ## Docker
 
@@ -447,6 +539,39 @@ mechanism rather than committing them.
   author list cannot alter the rule URL path. Java checks the primary location
   once at startup and switches the global rule location to the backup; this
   implementation retries the backup for each fetch.
+- **Rename schedule.** Sonarr (30 s) and Radarr (60 s) intervals match the Java
+  cron expressions, but the ticker counts from process start instead of the
+  wall-clock second. The history fallback windows are 30 minutes for both, as
+  in `application-prod.yml`. `DOWNLOADER_LOGIN_INTERVAL_SECS`,
+  `SONARR_RENAME_INTERVAL_SECS`, `RADARR_RENAME_INTERVAL_SECS`, and the two
+  fallback variables are environment extensions because Java stores these
+  timings in `application-prod.yml`.
+- **Downloader configuration.** qBittorrent is configured as a base URL; the
+  client appends `/api/v2/...`. Transmission is configured with the full
+  JSON-RPC URL, as in Java. Credentials now come from the same whitelist as
+  other `system_config` keys, with environment override.
+- **Downloader logging.** Java logs the qBittorrent cookie at debug level. This
+  implementation never logs cookies, session ids, passwords, or API keys.
+  Login failures are debug-level and non-fatal.
+- **Per-item rename errors.** A missing source title, an unavailable torrent
+  name, or a downloader HTTP error is isolated to that history item. Java
+  raises inside the item loop and catches the same class of failures; the
+  difference is that Rust skips blank titles instead of attempting a null
+  rename.
+- **qBittorrent responses.** Non-2xx rename/renameFile responses are errors for
+  that item, matching RestTemplate's exception behavior. The login path only
+  requires a 2xx status and a non-blank `Set-Cookie`, ignoring the body.
+- **Transmission responses.** Only HTTP status is checked; the JSON-RPC
+  `result` field is ignored, matching Java. A 409 triggers one re-login and one
+  retry; a second failure is isolated to the item.
+- **File rename scope.** File renames run only after a successful qBittorrent
+  torrent rename, only when `RENAME_FILE=true`, and use the Java path
+  construction, extension matching, subtitle numbering, and Sonarr token
+  fallback. Radarr uses the source title. Transmission has no file rename. No
+  media is deleted or moved outside the downloader.
+- **Configuration precedence.** Environment values override `system_config`;
+  built-in defaults fill the rest. Only the whitelisted keys are read, and no
+  value is logged.
 - **Rule fields.** Missing JSON fields preserve existing values, matching
   MyBatis `update-strategy=NOT_NULL`. The Java-compatible `validStatus=1`
   "do not change" behavior is preserved.
@@ -455,9 +580,6 @@ mechanism rather than committing them.
   are committed together.
 - **Radarr clean title.** If Radarr omits `cleanTitle`, the service derives it
   from the folder title. Java would attempt to write a null clean title.
-- **Configuration precedence.** Environment values override `system_config`;
-  built-in defaults fill the rest. Only the whitelisted baseline keys are read,
-  and no value is logged.
 - **Response formatting always re-encodes changed titles.** Unchanged item
   titles, all other XML, and the XML declaration are preserved. A response is
   returned byte-for-byte when it has no applicable item title changes.
@@ -472,13 +594,15 @@ src/formatting.rs   Java-compatible item title formatting
 src/torznab.rs      item counting, page merge/trim, XML title rewrite
 src/cache.rs        bounded TTL cache
 src/db.rs           sqlx SQLite queries and schema setup
+src/downloader.rs   qBittorrent/Transmission login, sessions and API calls
 src/import.rs       reference-table import path (`jproxy-rs import`)
+src/rename.rs       Sonarr/Radarr history rename tasks and schedules
 src/sync.rs         Sonarr/Radarr title sync, TMDB sync, rule sync, on-demand
 src/upstream.rs     reqwest/rustls upstream client, retry and concurrency
 src/query.rs        lossless-enough query parameter editing and cache keys
 src/text.rs         Java FormatUtil ports
 migrations/         Java-compatible SQLite schema
 fixtures/           exported reference DB and synthetic Torznab XML
-tests/              parity, sync, upstream-error and real-data integration tests
+tests/              parity, sync, downloader, rename and upstream-error tests
 scripts/            fixture export, local run and Java/Rust comparison
 ```
