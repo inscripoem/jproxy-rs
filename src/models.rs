@@ -14,6 +14,13 @@ impl AppKind {
         }
     }
 
+    pub fn index(self) -> usize {
+        match self {
+            Self::Sonarr => 0,
+            Self::Radarr => 1,
+        }
+    }
+
     pub fn title_table(self) -> &'static str {
         match self {
             Self::Sonarr => "sonarr_title",

@@ -70,6 +70,17 @@ pub fn build_search_steps(
     }];
 
     let Some(matched) = matched else {
+        // Java still tries the year-less query when the title is unknown.
+        if kind == AppKind::Radarr {
+            let without_year = remove_year(search_key);
+            if without_year != search_key {
+                steps.push(SearchStep {
+                    q: without_year,
+                    clear_season_episode: false,
+                    reason: SearchReason::AlternateTitle,
+                });
+            }
+        }
         return steps;
     };
 
@@ -267,6 +278,22 @@ mod tests {
         );
         // Only the initial query and the year-stripped retry; the fallback
         // duplicate is removed.
+        assert_eq!(
+            steps.iter().map(|step| step.q.as_str()).collect::<Vec<_>>(),
+            vec!["The Fifth Element 1997", "The Fifth Element"]
+        );
+    }
+
+    #[test]
+    fn radarr_plan_without_match_still_removes_year() {
+        let steps = build_search_steps(
+            AppKind::Radarr,
+            "The Fifth Element 1997",
+            "The Fifth Element",
+            None,
+            &[],
+            6,
+        );
         assert_eq!(
             steps.iter().map(|step| step.q.as_str()).collect::<Vec<_>>(),
             vec!["The Fifth Element 1997", "The Fifth Element"]

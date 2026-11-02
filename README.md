@@ -26,7 +26,17 @@ Implemented:
 - In-memory upstream result cache with TTL
   `INDEXER_RESULT_CACHE_EXPIRES`, bounded entry count, and API-key-free keys.
 - SQLite schema compatible with the upstream jproxy database.
-- Periodically synchronized Sonarr/Radarr titles and optional JSON rule feeds.
+- Scheduled Sonarr/Radarr title sync with Java-compatible upserts, plus TMDB
+  title sync for Sonarr rows with no translation.
+- On-demand Sonarr/Radarr title sync when a query misses the local database,
+  bounded by a timeout and degrading to normal proxy behavior on failure.
+- Rule sync using the Java GitHub author-directory protocol: `author.json`,
+  `sonarr@{author}.json`, and `radarr@{author}.json`, with backup-location
+  fallback and per-author error isolation.
+- Baseline `system_config` keys (`sonarrUrl`, `sonarrApikey`, `radarrUrl`,
+  `radarrApikey`, `tmdbUrl`, `tmdbApikey`, `sonarrLanguage1`,
+  `sonarrLanguage2`, `ruleSyncAuthors`) with environment override. Downloader
+  credentials are never read.
 - `GET /health` JSON endpoint.
 - Multi-stage Dockerfile.
 - Reference-data import from an existing `jproxy.db` (`jproxy-rs import`).
@@ -39,13 +49,8 @@ Not implemented (deferred Java behavior):
 - Admin UI, login, users, sessions, and `LOGIN_ENABLED` enforcement.
 - File renaming for qBittorrent/Transmission and `RENAME_FILE` behavior.
 - Downloader login tasks and downloader API proxying.
-- TMDB API synchronization. Existing `tmdb_title` rows are used, but this
-  service does not fetch new ones.
-- On-demand title synchronization when a query misses the local database.
-- The GitHub author-directory rule source. Direct JSON rule URLs are supported
-  instead.
 - Example-table management and the Java cache/system-config REST APIs.
-- The original Java Spring/Caffeine cache sizes and admin cache controls.
+- Java's admin cache controls and distributed/persistent caching.
 
 ## Build and test
 
@@ -71,13 +76,15 @@ The test suite includes:
 - `src/**` unit tests;
 - `tests/parity.rs` — the behaviour parity harness (SQLite + mock Torznab
   upstream, no live service);
+- `tests/sync.rs` — title, TMDB, rule and on-demand synchronization against
+  local mock Sonarr/Radarr/TMDB/rule endpoints;
 - `tests/upstream_errors.rs` — retry, concurrency and error-mapping tests;
 - `tests/real_data.rs` — validation against data exported from a live jproxy.
 
 The release profile sets `opt-level = "z"`, thin LTO, one codegen unit and
-`strip = true`; the resulting binary is about 8.5 MB and idles at roughly
-9.5 MB RSS. Panic unwinding is left enabled so a handler panic cannot abort the
-whole process.
+`strip = true`; the resulting binary is about 8.5 MB. Panic unwinding is left
+enabled so a handler panic cannot abort the whole process. See
+[Resource use](#resource-use) for measured RSS.
 
 ## Run
 
@@ -92,7 +99,9 @@ target/release/jproxy-rs
 ```
 
 The service creates missing tables on startup. It does not copy users, API
-keys, or any other upstream `system_config` values.
+keys, or any other upstream `system_config` values. At runtime it reads only the
+whitelisted baseline keys described under Configuration; downloader credentials
+and `system_user` rows are never selected.
 
 Torznab URLs to configure in Sonarr/Radarr:
 
@@ -177,9 +186,16 @@ for each query, and exits non-zero when any query differs. Without
 
 ## Configuration
 
-Configuration is environment-only in Phase 1. Existing `system_config` values
-are not read; keep secrets in the process environment or a service manager's
-secret store.
+Precedence is **environment > `system_config` > built-in default** for the
+baseline keys listed below. Only the following `system_config` keys are read:
+`sonarrUrl`, `sonarrApikey`, `radarrUrl`, `radarrApikey`, `tmdbUrl`,
+`tmdbApikey`, `sonarrLanguage1`, `sonarrLanguage2`, `ruleSyncAuthors`,
+`ruleLocation`, `ruleLocationBackup`. Downloader credentials and `system_user`
+rows are never selected. Values are never logged; the startup summary reports
+only booleans, intervals, and sizes. Values are resolved once at startup;
+restart the process after changing `system_config` or the environment.
+
+All other settings remain environment-only.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -187,22 +203,29 @@ secret store.
 | `DATABASE_PATH` | `./jproxy.db` | SQLite file. Missing tables are created. |
 | `PROWLARR_URL` | unset | Prowlarr base URL. |
 | `JACKETT_URL` | unset | Jackett base URL. |
-| `SONARR_URL` | unset | Sonarr base URL for title sync. |
-| `SONARR_API_KEY` | unset | Sonarr API key for sync. Never logged. |
-| `RADARR_URL` | unset | Radarr base URL for title sync. |
-| `RADARR_API_KEY` | unset | Radarr API key for sync. Never logged. |
-| `SONARR_RULES_URL` | unset | Optional direct URL to a Sonarr rule JSON array. |
-| `RADARR_RULES_URL` | unset | Optional direct URL to a Radarr rule JSON array. |
+| `SONARR_URL` | `system_config.sonarrUrl` | Sonarr base URL for title sync. |
+| `SONARR_API_KEY` | `system_config.sonarrApikey` | Sonarr API key for sync. Never logged. |
+| `RADARR_URL` | `system_config.radarrUrl` | Radarr base URL for title sync. |
+| `RADARR_API_KEY` | `system_config.radarrApikey` | Radarr API key for sync. Never logged. |
+| `TMDB_URL` | `https://api.themoviedb.org` | TMDB base URL. |
+| `TMDB_API_KEY` | `system_config.tmdbApikey` | TMDB API key. Never logged. |
+| `SONARR_LANGUAGE_1` | `zh-CN` | First TMDB title language. |
+| `SONARR_LANGUAGE_2` | `zh-TW` | Second TMDB title language. |
+| `RULE_SYNC_AUTHORS` | `system_config.ruleSyncAuthors` (`ALL`) | Comma-separated authors or `ALL`. Blank disables rule sync. |
+| `RULE_LOCATION` | Java GitHub rule directory | Base URL for `author.json` and rule files. Blank disables rule sync. |
+| `RULE_LOCATION_BACKUP` | Java backup mirror | Second base URL tried when the primary fails. Blank disables the backup. |
 | `CLEAN_TITLE_REGEX` | final upstream migration value | Clean-title punctuation regex. |
 | `SONARR_INDEXER_FORMAT` | `{title} {season}{episode} {language}{subtitle}{resolution}{quality}{dynamic_range}{group}` | Sonarr item format. |
 | `RADARR_INDEXER_FORMAT` | `{title} {year} {language}{subtitle}{resolution}{quality}{dynamic_range}{group}` | Radarr item format. |
 | `MIN_COUNT` | `6` | Stop alternate-title retries at this count. `0` disables retries. |
-| `CACHE_EXPIRES` | `4320` | Minutes for cached formatting rules and title candidates. |
-| `INDEXER_RESULT_CACHE_EXPIRES` | `15` | Minutes for upstream Torznab XML results. |
-| `SYNC_INTERVAL` | `3` | Minutes between background sync cycles. `0` disables sync. |
-| `SYNC_ENABLED` | `true` | Set `false` to disable the background task completely. |
-| `RENAME_FILE` | `true` | Parsed for deployment compatibility; Phase 1 ignores it. |
-| `LOGIN_ENABLED` | `false` | Parsed for deployment compatibility; Phase 1 has no auth. |
+| `CACHE_EXPIRES` | `4320` | Minutes for title, rule, and formatting caches (after-access). |
+| `INDEXER_RESULT_CACHE_EXPIRES` | `15` | Minutes for upstream Torznab XML results (after-create). |
+| `CACHE_MAX_ENTRIES` | `1000` | Maximum title-cache entries. |
+| `SYNC_INTERVAL` | `3` | Minutes for the title/on-demand sync gate. `0` disables sync. |
+| `SYNC_ENABLED` | `true` | Set `false` to disable background and on-demand sync. |
+| `ONDEMAND_SYNC_TIMEOUT_SECS` | `30` | Upper bound for one on-demand sync attempt. |
+| `RENAME_FILE` | `true` | Parsed for deployment compatibility; this baseline ignores it. |
+| `LOGIN_ENABLED` | `false` | Parsed for deployment compatibility; this baseline has no auth. |
 | `REQUEST_TIMEOUT_SECS` | `30` | Upstream and sync HTTP timeout. |
 | `RESULT_CACHE_MAX_ENTRIES` | `1000` | Maximum cached Torznab responses. |
 | `UPSTREAM_MAX_CONCURRENCY` | `8` | Maximum simultaneous upstream indexer requests. |
@@ -210,33 +233,54 @@ secret store.
 | `UPSTREAM_RETRY_BASE_MS` | `250` | Base delay for exponential backoff. |
 | `UPSTREAM_RETRY_MAX_MS` | `4000` | Maximum delay per retry; caps `Retry-After`. |
 
-`SYNC_INTERVAL=0`, `SYNC_ENABLED=false`, or a missing Sonarr/Radarr URL or API
-key disables the corresponding sync. A missing Prowlarr/Jackett URL makes the
-related routes return HTTP 503.
+`SYNC_INTERVAL=0` or `SYNC_ENABLED=false` disables both background and
+on-demand synchronization. A missing Sonarr/Radarr URL or API key skips that
+kind. A missing Prowlarr/Jackett URL makes the related routes return HTTP 503.
+
+### Background schedule
+
+Titles synchronize hourly and rules daily, approximating the Java cron schedule
+from process start rather than at Java's fixed minutes. The first tick runs
+immediately. The `SYNC_INTERVAL` gate limits title synchronization (background
+and on-demand) to one attempt per interval; it does not make rules refresh every
+three minutes. `SYNC_INTERVAL` defaults to 3, matching Java's Caffeine gate.
 
 ### Rule synchronization
 
-Sonarr and Radarr APIs expose series/movie metadata, not jproxy formatting
-rules. Phase 1 therefore syncs titles from `/api/v3/series` and `/api/v3/movie`,
-and optionally syncs rules from `SONARR_RULES_URL` / `RADARR_RULES_URL`. The
-rule source must return the upstream rule JSON array shape:
+Sonarr and Radarr do not expose jproxy formatting rules. The service follows
+Java's GitHub author-directory protocol:
 
-```json
-[
-  {
-    "id": "RULE-ID",
-    "token": "title",
-    "priority": 999,
-    "regex": ".*(\\b|\\s){cleanTitle}(\\b|\\s).*",
-    "replacement": "{mainTitle}",
-    "offset": 0
-  }
-]
-```
+1. Read `ruleSyncAuthors`. `ALL` fetches `{RULE_LOCATION}/author.json` and uses
+   its JSON string array; otherwise the value is split on commas.
+2. For each author and kind, fetch `{RULE_LOCATION}/sonarr@{author}.json` or
+   `{RULE_LOCATION}/radarr@{author}.json`.
+3. If the primary location fails, retry the same path under
+   `RULE_LOCATION_BACKUP`.
+4. Upsert by `id`. Remote `validStatus: 1` is treated as "do not change" so a
+   locally disabled rule stays disabled; `validStatus: 0` disables it. Missing
+   rule fields preserve existing values.
 
-Rule rows are upserted by `id`. Title rows are upserted by the Java-compatible
-`{external_id}{sno}` integer key. Sync does not delete rows that disappeared
-upstream, matching Java's `saveOrUpdateBatch` behavior.
+A failure for one author is logged and skipped; the remaining authors still
+sync. A blank `RULE_SYNC_AUTHORS` or `RULE_LOCATION` disables rule sync.
+
+### TMDB title synchronization
+
+After a Sonarr title sync, the service selects `sonarr_title.sno = 0` rows whose
+`tvdb_id` has no `tmdb_title` row. For each id and each configured language it
+calls `{TMDB_URL}/3/find/{tvdbId}?api_key=...&language=...&external_source=tvdb_id`
+and inserts the first `tv_results` entry. The API key is read from the
+environment or `system_config.tmdbApikey` and is never logged. Tests use a local
+mock; no test makes a live TMDB request.
+
+### On-demand synchronization
+
+When `find_title` misses, the proxy calls the same gated title sync as the
+background task, then refreshes TMDB for Sonarr (matching
+`syncAndGetSonarrTitle`). A per-kind mutex serializes concurrent misses. The
+whole path is bounded by `ONDEMAND_SYNC_TIMEOUT_SECS`; a sync failure is logged
+and the request continues with its normal proxy behavior instead of returning
+500. The resolved lookup, including a miss, is cached like Java's synthetic
+search-title result and is cleared by the next successful sync.
 
 ## Query behavior
 
@@ -247,7 +291,9 @@ For a request with a non-blank `q`:
    strips a trailing ` (19|20)xx` year token before lookup. The upstream query
    keeps the original `q` in both cases.
 3. The clean title is looked up in `sonarr_title`/`radarr_title`; Sonarr also
-   retries after removing a trailing `" Sxx"` season token.
+   retries after removing a trailing `" Sxx"` season token. On a miss, the
+   service attempts a gated on-demand title sync (and TMDB for Sonarr) before
+   continuing.
 4. The first upstream request preserves the original query except for the
    trailing `" 00"` cleanup.
 5. If the merged result count is below `MIN_COUNT`, TMDB alternate titles are
@@ -289,15 +335,45 @@ upstream error.
 
 ## Caching
 
-- The result cache stores final XML bodies and content types for successful
-  responses containing `<channel>`.
+- The indexer-result cache stores final XML bodies and content types for
+  successful responses containing `<channel>`. It uses
+  `INDEXER_RESULT_CACHE_EXPIRES` with Caffeine's `expireAfterCreate` semantics,
+  matching Java's `indexerResultCache`, and is **not** evicted when rules or
+  titles are synced.
 - Cache keys include the app kind, provider, indexer id, and normalized query
   parameters, but exclude `apikey`.
-- Cache entries are process-local and are not evicted when rules or titles are
-  synced. Lower `INDEXER_RESULT_CACHE_EXPIRES` when rule changes must take
-  effect quickly.
-- Formatting rules/title candidates are cached separately for `CACHE_EXPIRES`
-  and are cleared after a successful background sync.
+- The title lookup cache uses `CACHE_EXPIRES` with `expireAfterAccess`
+  semantics, matching the Java `sonarr_search_title`/`radarr_search_title`
+  caches. It stores the resolved lookup, including the synthetic miss result
+  Java caches, and is cleared by the next successful reference-data sync.
+- Formatting rules and title candidates use `CACHE_EXPIRES` with
+  `expireAfterAccess`, matching the Java `*_result_title` and `*_rule` caches.
+- Both reference-data caches are cleared after a successful title, TMDB, or rule
+  sync.
+- All caches are process-local and bounded. Eviction is not LRU-identical to
+  Caffeine; Java's admin cache controls are not part of this baseline.
+
+## Resource use
+
+Measured with the release binary, a temporary SQLite database, and local mock
+Sonarr/Radarr/TMDB/rule/Torznab endpoints. RSS is `VmRSS` from
+`/proc/<pid>/status`, sampled three times per phase; the first three rows are
+the median of three independent runs, with the observed range in parentheses.
+The full-cache row is one run.
+
+| Phase | Workload | RSS |
+| --- | --- | --- |
+| Idle | `SYNC_ENABLED=false`, no requests | 9.5 MB (9,636–9,772 KB) |
+| After one sync pass | 120 series (360 title rows), 600 movies (3,000 title rows), 240 TMDB rows, 5+5 rules | 12.5 MB (12,720–13,252 KB) |
+| Under proxy load | 2,000 Torznab queries, 16 concurrent, 500 distinct `q` values | 25.6 MB (26,116–26,336 KB) |
+| Under proxy load, full cache | 2,000 Torznab queries, 16 concurrent, 2,000 distinct `q` values, one run | 28.0 MB (28,692 KB) |
+
+Both load phases are below the 30–45 MB baseline target on this synthetic
+corpus. The full-cache row exercises the 1,000-entry result-cache capacity;
+larger upstream feeds, a larger database, or a different allocator can raise
+the number. The numbers are current `VmRSS`, not peak `VmHWM`; SQLite page cache
+and allocator retention are included. The mocks and data are local and
+synthetic; no live service or credential was used.
 
 ## SQLite compatibility
 
@@ -305,8 +381,9 @@ The bundled `sqlx` SQLite build uses its own SQLite library. The schema in
 `migrations/0001_schema.sql` mirrors the final upstream Liquibase migrations,
 including the later `series_id` and `movie_id` columns. There is no Liquibase
 metadata table in this project, so an existing `jproxy.db` can be opened
-directly, but run it against a backup first. The service never reads
-`system_config` or `system_user` rows.
+directly, but run it against a backup first. The service reads only the
+whitelisted baseline `system_config` keys and never reads `system_user` or
+downloader credentials.
 
 ## Docker
 
@@ -355,14 +432,32 @@ mechanism rather than committing them.
 - **Rule tie-break.** Java orders rules by `priority ASC` only. This
   implementation adds a stable `id ASC` tie-break so equal priorities are
   deterministic; the bundled rule set has unique priorities.
-- **No on-demand sync.** A query miss does not trigger a live Sonarr/Radarr sync.
-  The background task is the only updater.
-- **Rule source.** Sonarr/Radarr do not expose formatting rules, so optional
-  direct JSON URLs replace Java's GitHub author-directory feed.
-- **Existing DB configuration.** Environment variables are authoritative.
-  `system_config` values from an existing database are intentionally ignored.
-- **Cache scope.** Java's Caffeine caches are replaced with a small process-local
-  TTL cache. There is no distributed or persistent cache.
+- **Sync schedule.** Titles run hourly and rules daily from process start. Java
+  uses cron at `:00`/`:30` and `00:15`/`01:45` local time. The three-minute
+  `SYNC_INTERVAL` gate and the Java-compatible upserts are preserved.
+- **On-demand sync.** Java's synchronized path can propagate an HTTP failure.
+  This implementation bounds the attempt with `ONDEMAND_SYNC_TIMEOUT_SECS`,
+  serializes concurrent misses per kind, logs failures, and continues with the
+  normal proxy response instead of returning 500.
+- **Rule source.** The Java author-directory protocol is used. `ruleLocation`
+  and `ruleLocationBackup` are accepted as `system_config` keys (and
+  `RULE_LOCATION`/`RULE_LOCATION_BACKUP` environment variables) because Java
+  keeps these in `application-prod.yml` rather than `system_config`. Author
+  names are restricted to ASCII letters, digits, `_`, `-`, and `.` so a remote
+  author list cannot alter the rule URL path. Java checks the primary location
+  once at startup and switches the global rule location to the backup; this
+  implementation retries the backup for each fetch.
+- **Rule fields.** Missing JSON fields preserve existing values, matching
+  MyBatis `update-strategy=NOT_NULL`. The Java-compatible `validStatus=1`
+  "do not change" behavior is preserved.
+- **TMDB errors.** A failed TMDB lookup for one id/language is logged and the
+  remaining ids still sync; Java aborts the whole transaction. Successful rows
+  are committed together.
+- **Radarr clean title.** If Radarr omits `cleanTitle`, the service derives it
+  from the folder title. Java would attempt to write a null clean title.
+- **Configuration precedence.** Environment values override `system_config`;
+  built-in defaults fill the rest. Only the whitelisted baseline keys are read,
+  and no value is logged.
 - **Response formatting always re-encodes changed titles.** Unchanged item
   titles, all other XML, and the XML declaration are preserved. A response is
   returned byte-for-byte when it has no applicable item title changes.
@@ -378,12 +473,12 @@ src/torznab.rs      item counting, page merge/trim, XML title rewrite
 src/cache.rs        bounded TTL cache
 src/db.rs           sqlx SQLite queries and schema setup
 src/import.rs       reference-table import path (`jproxy-rs import`)
-src/sync.rs         Sonarr/Radarr title sync and optional rule sync
+src/sync.rs         Sonarr/Radarr title sync, TMDB sync, rule sync, on-demand
 src/upstream.rs     reqwest/rustls upstream client, retry and concurrency
 src/query.rs        lossless-enough query parameter editing and cache keys
 src/text.rs         Java FormatUtil ports
 migrations/         Java-compatible SQLite schema
 fixtures/           exported reference DB and synthetic Torznab XML
-tests/              parity, upstream-error and real-data integration tests
+tests/              parity, sync, upstream-error and real-data integration tests
 scripts/            fixture export, local run and Java/Rust comparison
 ```

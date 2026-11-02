@@ -20,9 +20,9 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     info!("starting jproxy-rs {}", env!("CARGO_PKG_VERSION"));
-    info!("{}", config.startup_summary());
 
     let state = AppState::new(config).await?;
+    info!("{}", state.config.startup_summary());
     sync::spawn(state.clone());
 
     let listen_addr = state.config.listen_addr;

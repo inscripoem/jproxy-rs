@@ -12,13 +12,14 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use tower_http::trace::TraceLayer;
 
-use crate::cache::TtlCache;
+use crate::cache::{Expiry, TtlCache};
 use crate::config::Config;
 use crate::db;
 use crate::formatting::FormattingData;
-use crate::models::{AppKind, Provider};
+use crate::models::{AppKind, MatchedTitle, Provider};
 use crate::query::QueryParams;
 use crate::search::{SearchPage, SearchRun, build_search_steps, execute_search};
+use crate::sync::SyncState;
 use crate::text::{remove_episode, remove_year};
 use crate::torznab;
 use crate::upstream::{UpstreamClient, UpstreamError, validate_indexer_id};
@@ -30,7 +31,15 @@ pub struct AppState {
     pub upstream: UpstreamClient,
     pub result_cache: Arc<TtlCache<Arc<CachedBody>>>,
     pub formatting_cache: Arc<TtlCache<Option<Arc<FormattingData>>>>,
+    pub title_cache: Arc<TtlCache<TitleLookup>>,
+    pub sync: Arc<SyncState>,
     pub clean_title_regex: Arc<Regex>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TitleLookup {
+    pub matched: Option<MatchedTitle>,
+    pub tmdb_titles: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,10 +49,19 @@ pub struct CachedBody {
 }
 
 impl AppState {
-    pub async fn new(config: Config) -> Result<Self> {
+    pub async fn new(mut config: Config) -> Result<Self> {
+        let pool = db::connect(&config.database_path).await?;
+        match db::load_system_config_values(&pool).await {
+            Ok(values) => config.apply_system_config(&values),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "system_config values unavailable; using environment and defaults"
+                );
+            }
+        }
         let clean_title_regex = Regex::new(&config.clean_title_regex)
             .context("CLEAN_TITLE_REGEX is not a valid regular expression")?;
-        let pool = db::connect(&config.database_path).await?;
         let upstream = UpstreamClient::with_policy(
             config.prowlarr_url.clone(),
             config.jackett_url.clone(),
@@ -51,17 +69,29 @@ impl AppState {
             config.upstream_retry,
             config.upstream_max_concurrency,
         )?;
-        let result_cache = Arc::new(TtlCache::new(
+        let result_cache = Arc::new(TtlCache::with_expiry(
             config.indexer_result_cache_expires,
             config.result_cache_max_entries,
+            Expiry::AfterCreate,
         ));
-        let formatting_cache = Arc::new(TtlCache::new(config.cache_expires, 2));
+        let formatting_cache = Arc::new(TtlCache::with_expiry(
+            config.cache_expires,
+            2,
+            Expiry::AfterAccess,
+        ));
+        let title_cache = Arc::new(TtlCache::with_expiry(
+            config.cache_expires,
+            config.cache_max_entries,
+            Expiry::AfterAccess,
+        ));
         Ok(Self {
             config: Arc::new(config),
             pool,
             upstream,
             result_cache,
             formatting_cache,
+            title_cache,
+            sync: Arc::new(SyncState::new()),
             clean_title_regex: Arc::new(clean_title_regex),
         })
     }
@@ -83,6 +113,58 @@ impl AppState {
             .insert(key.to_owned(), data.clone())
             .await;
         Ok(data)
+    }
+
+    /// Resolve a query title, triggering Java-compatible on-demand sync on a
+    /// miss. Results, including a synthetic miss, are cached under
+    /// `CACHE_EXPIRES` and cleared by the next successful sync.
+    async fn title_lookup(&self, kind: AppKind, title: &str) -> Result<TitleLookup> {
+        let key = format!("{}:{title}", kind.as_str());
+        if let Some(cached) = self.title_cache.get(&key).await {
+            return Ok(cached);
+        }
+
+        let mut matched = db::find_title(&self.pool, kind, title, &self.clean_title_regex).await?;
+        if matched.is_none() {
+            matched = crate::sync::sync_and_get_title(self, kind, title).await;
+        }
+
+        let tmdb_titles = if kind == AppKind::Sonarr
+            && matched
+                .as_ref()
+                .is_some_and(|matched| matches!(matched.sno, 0 | 1))
+            && let Some(tvdb_id) = matched.as_ref().and_then(|matched| matched.tvdb_id)
+        {
+            match db::query_tmdb_titles(&self.pool, tvdb_id).await {
+                Ok(titles) => titles,
+                Err(error) => {
+                    tracing::warn!(
+                        %kind,
+                        %error,
+                        "TMDB title lookup failed; continuing without alternates"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let lookup = TitleLookup {
+            matched,
+            tmdb_titles,
+        };
+        // Java caches the complete search-title result, including the synthetic
+        // title it uses when synchronization cannot find a match. The entry is
+        // cleared by the next successful reference-data sync.
+        self.title_cache.insert(key, lookup.clone()).await;
+        Ok(lookup)
+    }
+
+    /// Clear caches whose Java counterparts are evicted by title/rule sync.
+    pub async fn clear_reference_caches(&self) {
+        self.formatting_cache.clear().await;
+        self.title_cache.clear().await;
     }
 }
 
@@ -290,31 +372,18 @@ async fn search_request(
         AppKind::Radarr => remove_year(&search_key),
     };
 
-    let matched =
-        match db::find_title(&state.pool, kind, &lookup_title, &state.clean_title_regex).await {
-            Ok(matched) => matched,
-            Err(error) => {
-                tracing::error!(%kind, %error, "title lookup failed");
-                return Err(ProxyError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "database lookup failed",
-                ));
-            }
-        };
-
-    let mut tmdb_titles = Vec::new();
-    if kind == AppKind::Sonarr
-        && let Some(matched) = &matched
-        && matches!(matched.sno, 0 | 1)
-        && let Some(tvdb_id) = matched.tvdb_id
-    {
-        match db::query_tmdb_titles(&state.pool, tvdb_id).await {
-            Ok(titles) => tmdb_titles = titles,
-            Err(error) => {
-                tracing::warn!(%kind, %error, "TMDB title lookup failed; continuing without alternates");
-            }
+    let lookup = match state.title_lookup(kind, &lookup_title).await {
+        Ok(lookup) => lookup,
+        Err(error) => {
+            tracing::error!(%kind, %error, "title lookup failed");
+            return Err(ProxyError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database lookup failed",
+            ));
         }
-    }
+    };
+    let matched = lookup.matched;
+    let tmdb_titles = lookup.tmdb_titles;
 
     let steps = build_search_steps(
         kind,

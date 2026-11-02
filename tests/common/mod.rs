@@ -16,7 +16,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
-use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt;
 use jproxy_rs::app::{AppState, router as app_router};
@@ -67,6 +67,13 @@ impl MockResponse {
         }
     }
 
+    pub fn json(body: impl Into<String>) -> Self {
+        Self {
+            content_type: "application/json".to_owned(),
+            ..Self::ok(body)
+        }
+    }
+
     pub fn with_body(mut self, body: impl Into<String>) -> Self {
         self.body = body.into();
         self
@@ -85,6 +92,7 @@ impl MockResponse {
 
 #[derive(Clone, Debug)]
 pub struct Recorded {
+    pub path: String,
     pub q: Option<String>,
     /// The raw query string exactly as received upstream (minus the leading `?`).
     pub query: String,
@@ -93,7 +101,8 @@ pub struct Recorded {
 #[derive(Default)]
 struct Plan {
     by_query: HashMap<String, MockResponse>,
-    /// When non-empty, consumed in order and overrides `by_query`.
+    by_path: HashMap<String, MockResponse>,
+    /// When non-empty, consumed in order and overrides `by_path`/`by_query`.
     script: Vec<MockResponse>,
     position: usize,
     fallback: Option<MockResponse>,
@@ -151,6 +160,17 @@ impl MockIndexer {
             .insert(q.to_owned(), response);
     }
 
+    /// Return `response` whenever the request path matches exactly.
+    pub fn route_path(&self, path: &str, response: MockResponse) {
+        self.state
+            .inner
+            .plan
+            .lock()
+            .unwrap()
+            .by_path
+            .insert(path.to_owned(), response);
+    }
+
     /// Response used when no `q` route matches.
     pub fn fallback(&self, response: MockResponse) {
         self.state.inner.plan.lock().unwrap().fallback = Some(response);
@@ -183,6 +203,14 @@ impl MockIndexer {
             .collect()
     }
 
+    /// Request paths in arrival order.
+    pub fn recorded_paths(&self) -> Vec<String> {
+        self.recorded()
+            .into_iter()
+            .map(|record| record.path)
+            .collect()
+    }
+
     pub fn request_count(&self) -> usize {
         self.state.inner.log.lock().unwrap().len()
     }
@@ -197,8 +225,9 @@ impl MockIndexer {
     }
 }
 
-async fn handle(State(state): State<MockState>, RawQuery(query): RawQuery) -> Response {
+async fn handle(State(state): State<MockState>, uri: Uri, RawQuery(query): RawQuery) -> Response {
     let query = query.unwrap_or_default();
+    let path = uri.path().to_owned();
     let current = state.inner.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     state
         .inner
@@ -207,6 +236,7 @@ async fn handle(State(state): State<MockState>, RawQuery(query): RawQuery) -> Re
 
     let q = QueryParams::parse(&query).get("q").map(str::to_owned);
     state.inner.log.lock().unwrap().push(Recorded {
+        path: path.clone(),
         q: q.clone(),
         query: query.clone(),
     });
@@ -221,6 +251,7 @@ async fn handle(State(state): State<MockState>, RawQuery(query): RawQuery) -> Re
             Some(plan.script[index].clone())
         };
         scripted
+            .or_else(|| plan.by_path.get(&path).cloned())
             .or_else(|| plan.by_query.get(q.as_deref()?).cloned())
             .or_else(|| plan.fallback.clone())
             .unwrap_or_else(|| MockResponse::ok(EMPTY_FEED))
@@ -286,8 +317,13 @@ impl TestEnv {
             sonarr_api_key: None,
             radarr_url: None,
             radarr_api_key: None,
-            sonarr_rules_url: None,
-            radarr_rules_url: None,
+            tmdb_url: None,
+            tmdb_api_key: None,
+            sonarr_language_1: None,
+            sonarr_language_2: None,
+            rule_location: None,
+            rule_location_backup: None,
+            rule_sync_authors: None,
             clean_title_regex: DEFAULT_CLEAN_TITLE_REGEX.to_owned(),
             sonarr_indexer_format: DEFAULT_SONARR_FORMAT.to_owned(),
             radarr_indexer_format: DEFAULT_RADARR_FORMAT.to_owned(),
@@ -299,7 +335,9 @@ impl TestEnv {
             login_enabled: false,
             sync_enabled: false,
             request_timeout: Duration::from_secs(5),
+            on_demand_sync_timeout: Duration::from_secs(5),
             result_cache_max_entries: 100,
+            cache_max_entries: 100,
             upstream_max_concurrency: 8,
             upstream_retry: RetryPolicy {
                 max_retries: 2,

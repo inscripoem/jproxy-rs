@@ -8,21 +8,38 @@ struct Entry<V> {
     value: V,
 }
 
+/// Caffeine-compatible expiry mode.
+///
+/// Java uses `expireAfterAccess` for the general cache manager and
+/// `expireAfterCreate` for the indexer-result and sync-interval caches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expiry {
+    AfterCreate,
+    AfterAccess,
+}
+
 /// Small in-process TTL cache with bounded entry count.
 ///
 /// Expiry is lazy: an entry is removed when read after its TTL, and expired
-/// entries are purged before capacity eviction.
+/// entries are purged before capacity eviction. An `AfterAccess` cache resets
+/// the timer on every successful read, matching Caffeine.
 pub struct TtlCache<V> {
     ttl: Duration,
     capacity: usize,
+    expiry: Expiry,
     entries: RwLock<HashMap<String, Entry<V>>>,
 }
 
 impl<V: Clone> TtlCache<V> {
     pub fn new(ttl: Duration, capacity: usize) -> Self {
+        Self::with_expiry(ttl, capacity, Expiry::AfterCreate)
+    }
+
+    pub fn with_expiry(ttl: Duration, capacity: usize, expiry: Expiry) -> Self {
         Self {
             ttl,
             capacity,
+            expiry,
             entries: RwLock::new(HashMap::new()),
         }
     }
@@ -32,8 +49,13 @@ impl<V: Clone> TtlCache<V> {
             return None;
         }
         let mut entries = self.entries.write().await;
-        match entries.get(key) {
-            Some(entry) if entry.inserted_at.elapsed() < self.ttl => Some(entry.value.clone()),
+        match entries.get_mut(key) {
+            Some(entry) if entry.inserted_at.elapsed() < self.ttl => {
+                if self.expiry == Expiry::AfterAccess {
+                    entry.inserted_at = Instant::now();
+                }
+                Some(entry.value.clone())
+            }
             Some(_) => {
                 entries.remove(key);
                 None
@@ -88,6 +110,28 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(cache.get("key").await, None);
         assert_eq!(cache.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn after_access_reads_refresh_the_timer() {
+        let cache = TtlCache::with_expiry(Duration::from_millis(80), 4, Expiry::AfterAccess);
+        cache.insert("key".to_owned(), 1_u8).await;
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(cache.get("key").await, Some(1));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cache.get("key").await, None);
+    }
+
+    #[tokio::test]
+    async fn after_create_reads_do_not_refresh_the_timer() {
+        let cache = TtlCache::with_expiry(Duration::from_millis(80), 4, Expiry::AfterCreate);
+        cache.insert("key".to_owned(), 1_u8).await;
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert_eq!(cache.get("key").await, None);
     }
 
     #[tokio::test]

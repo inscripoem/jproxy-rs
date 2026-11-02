@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ use regex::Regex;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
+use crate::config::SystemConfigValues;
 use crate::models::{AppKind, MatchedTitle, Rule, TitleCandidate};
 use crate::text::{clean_title, remove_season};
 
@@ -49,6 +51,72 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
 pub async fn healthcheck(pool: &SqlitePool) -> Result<()> {
     let _: i64 = sqlx::query_scalar("SELECT 1").fetch_one(pool).await?;
     Ok(())
+}
+
+/// Load only the whitelisted baseline `system_config` rows.
+///
+/// Downloader credentials and user rows are never selected. Values are kept in
+/// memory and are not logged by the caller.
+pub async fn load_system_config_values(pool: &SqlitePool) -> Result<SystemConfigValues> {
+    let keys = crate::config::Config::baseline_system_config_keys();
+    let placeholders = vec!["?"; keys.len()].join(",");
+    let sql = format!(
+        "SELECT \"key\", value FROM system_config \
+         WHERE valid_status = 1 AND \"key\" IN ({placeholders})"
+    );
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+    for key in keys {
+        query = query.bind(*key);
+    }
+    let rows = query.fetch_all(pool).await?;
+    let mut values = HashMap::new();
+    for row in rows {
+        let key: String = row.try_get("key")?;
+        if let Some(value) = row.try_get::<Option<String>, _>("value")? {
+            values.insert(key, value);
+        }
+    }
+    Ok(SystemConfigValues::new(values))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmdbTitleRow {
+    pub tvdb_id: i64,
+    pub tmdb_id: Option<i64>,
+    pub language: String,
+    pub title: String,
+}
+
+/// Java `SonarrTitleMapper.selectNeedSyncTmdbTitle`.
+pub async fn list_tvdb_ids_needing_tmdb(pool: &SqlitePool) -> Result<Vec<i64>> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT st.tvdb_id \
+         FROM sonarr_title st LEFT JOIN tmdb_title tt ON st.tvdb_id = tt.tvdb_id \
+         WHERE st.sno = 0 AND tt.tvdb_id IS NULL \
+         ORDER BY st.tvdb_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| row.try_get::<i64, _>("tvdb_id").map_err(Into::into))
+        .collect()
+}
+
+pub async fn insert_tmdb_titles(pool: &SqlitePool, rows: &[TmdbTitleRow]) -> Result<usize> {
+    let mut transaction = pool.begin().await?;
+    for row in rows {
+        sqlx::query(
+            "INSERT INTO tmdb_title (tvdb_id, tmdb_id, language, title) VALUES (?, ?, ?, ?)",
+        )
+        .bind(row.tvdb_id)
+        .bind(row.tmdb_id)
+        .bind(&row.language)
+        .bind(&row.title)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(rows.len())
 }
 
 pub async fn find_title(
@@ -314,5 +382,47 @@ mod tests {
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].id, "a");
         assert_eq!(rules[1].id, "b");
+    }
+
+    #[tokio::test]
+    async fn system_config_loader_reads_only_baseline_keys() {
+        let pool = connect_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO system_config (\"key\", value, valid_status) VALUES \
+             ('sonarrUrl', 'http://synthetic.invalid', 1), \
+             ('sonarrApikey', 'synthetic-key', 1), \
+             ('ruleSyncAuthors', 'alice', 1), \
+             ('qbittorrentPassword', 'must-not-be-read', 1), \
+             ('tmdbApikey', 'ignored-invalid-row', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let values = load_system_config_values(&pool).await.unwrap();
+        assert_eq!(values.get("sonarrUrl"), Some("http://synthetic.invalid"));
+        assert_eq!(values.get("sonarrApikey"), Some("synthetic-key"));
+        assert_eq!(values.get("ruleSyncAuthors"), Some("alice"));
+        assert_eq!(values.get("qbittorrentPassword"), None);
+        assert_eq!(values.get("tmdbApikey"), None);
+    }
+
+    #[tokio::test]
+    async fn tmdb_need_list_ignores_rows_with_any_translation() {
+        let pool = connect_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO sonarr_title \
+             (id, tvdb_id, sno, main_title, title, clean_title, season_number, monitored) \
+             VALUES (10, 1, 0, 'One', 'One', 'one', -1, 1), \
+                    (11, 1, 1, 'One', 'One', 'one', -1, 1), \
+                    (20, 2, 0, 'Two', 'Two', 'two', -1, 1); \
+             INSERT INTO tmdb_title (tvdb_id, language, title) VALUES (2, 'zh-CN', '二')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ids = list_tvdb_ids_needing_tmdb(&pool).await.unwrap();
+        assert_eq!(ids, vec![1]);
     }
 }
