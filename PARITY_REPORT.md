@@ -1,16 +1,24 @@
 # Parity Report
 
-Milestone: jproxy-rs 1:1 parity, baseline and downloader/rename feature phases.
+Milestone: jproxy-rs 1:1 parity, baseline and extra feature phases.
 
 ## Commits
+
+Baseline on `main`:
 
 - `8b976fa` — `jproxy-rs: baseline core proxy parity` (core proxy, 12/12 live
   query parity).
 - `6f5bedb` — `jproxy-rs: baseline sync parity` (synchronization layer).
-- Feature phase — branch `features/full-parity`, commit message
-  `jproxy-rs: downloader login and rename parity` (not pushed).
+- `cce9c99` — `jproxy-rs: baseline parity report`.
+- `e73d373` — `jproxy-rs: record live sync check`.
 
-Baseline branch: `main`. Feature worktree started at `e73d373`.
+Extra features on `features/full-parity` (not pushed, not merged):
+
+- `a343ba9` — `jproxy-rs: downloader login and rename parity`.
+- `17c9d1f` — `jproxy-rs: admin ui api auth parity`.
+
+Feature worktree: `~/dev/jproxy-rs-features`, branch `features/full-parity`.
+All planned feature phases are implemented and tested; merge awaits review.
 
 ## Implemented baseline
 
