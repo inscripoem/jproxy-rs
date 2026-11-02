@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Fixture Indexer</title>
+    <description>Fixture Indexer</description>
+    <link>https://indexer.invalid/</link>
+    <language>en-us</language>
+    <item>
+      <title>Jackie Chan Adventures S01E05 [SubsPlease] 1080p</title>
+      <description>Group release / 1080p</description>
+      <link>https://indexer.invalid/download/301</link>
+      <guid>https://indexer.invalid/download/301</guid>
+      <torznab:attr name="size" value="1073741824" />
+    </item>
+    <item>
+      <title>Completely Unrelated Show S01E01 1080p</title>
+      <description>Should be left untouched</description>
+      <link>https://indexer.invalid/download/302</link>
+      <guid>https://indexer.invalid/download/302</guid>
+      <torznab:attr name="size" value="1073741824" />
+    </item>
+  </channel>
+</rss>

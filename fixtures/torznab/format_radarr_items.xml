@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Fixture Indexer</title>
+    <description>Fixture Indexer</description>
+    <link>https://indexer.invalid/</link>
+    <language>zh-cn</language>
+    <item>
+      <title>第五元素.1997.1080p.BluRay.x264</title>
+      <description>第五元素 / The Fifth Element</description>
+      <link>https://indexer.invalid/download/401</link>
+      <guid>https://indexer.invalid/download/401</guid>
+      <torznab:attr name="size" value="10737418240" />
+    </item>
+    <item>
+      <title>Unrelated.Movie.2019.1080p.BluRay.x264</title>
+      <description>Should be left untouched</description>
+      <link>https://indexer.invalid/download/402</link>
+      <guid>https://indexer.invalid/download/402</guid>
+      <torznab:attr name="size" value="1073741824" />
+    </item>
+  </channel>
+</rss>

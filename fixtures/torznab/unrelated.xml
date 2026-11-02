@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Fixture Indexer</title>
+    <description>Fixture Indexer</description>
+    <link>https://indexer.invalid/</link>
+    <language>en-us</language>
+    <item>
+      <title>Some.Unrelated.Release.2021.1080p.WEB-DL</title>
+      <description>Nothing matches the requested title</description>
+      <link>https://indexer.invalid/download/1</link>
+      <guid>https://indexer.invalid/download/1</guid>
+      <torznab:attr name="size" value="1073741824" />
+    </item>
+  </channel>
+</rss>

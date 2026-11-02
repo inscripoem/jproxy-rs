@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Fixture Indexer</title>
+    <description>Fixture Indexer</description>
+    <link>https://indexer.invalid/</link>
+    <language>en-us</language>
+    <item>
+      <title>成龍小子 S01E01 1080p WEB-DL AAC x264</title>
+      <description>成龍小子 / 第一季</description>
+      <link>https://indexer.invalid/download/201</link>
+      <guid>https://indexer.invalid/download/201</guid>
+      <torznab:attr name="size" value="1073741824" />
+    </item>
+    <item>
+      <title>成龍小子 S01E02 1080p WEB-DL AAC x264</title>
+      <description>成龍小子 / 第一季</description>
+      <link>https://indexer.invalid/download/202</link>
+      <guid>https://indexer.invalid/download/202</guid>
+      <torznab:attr name="size" value="1073741824" />
+    </item>
+    <item>
+      <title>成龍小子 S01E04 1080p WEB-DL AAC x264</title>
+      <description>成龍小子 / 第一季</description>
+      <link>https://indexer.invalid/download/204</link>
+      <guid>https://indexer.invalid/download/204</guid>
+      <torznab:attr name="size" value="1073741824" />
+    </item>
+  </channel>
+</rss>

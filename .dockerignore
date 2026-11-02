@@ -1,0 +1,14 @@
+target
+.git
+.direnv
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.envrc
+result
+result-*
