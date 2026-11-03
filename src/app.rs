@@ -1,24 +1,24 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderValue, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
-use regex::Regex;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::AuthState;
 use crate::cache::{Expiry, TtlCache};
-use crate::config::Config;
+use crate::config::{Config, ConfigSnapshot, ConfigStore};
 use crate::db;
 use crate::downloader::Downloaders;
 use crate::formatting::FormattingData;
 use crate::models::{AppKind, MatchedTitle, Provider};
+use crate::probe::Prober;
 use crate::query::QueryParams;
 use crate::search::{SearchPage, SearchRun, build_search_steps, execute_search};
 use crate::sync::SyncState;
@@ -28,15 +28,15 @@ use crate::upstream::{UpstreamClient, UpstreamError, validate_indexer_id};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
+    pub config: Arc<ConfigStore>,
     pub pool: SqlitePool,
     pub upstream: UpstreamClient,
     pub downloaders: Downloaders,
+    pub prober: Prober,
     pub result_cache: Arc<TtlCache<Arc<CachedBody>>>,
     pub formatting_cache: Arc<TtlCache<Option<Arc<FormattingData>>>>,
     pub title_cache: Arc<TtlCache<TitleLookup>>,
     pub sync: Arc<SyncState>,
-    pub clean_title_regex: Arc<Regex>,
     pub auth: Arc<AuthState>,
 }
 
@@ -53,10 +53,11 @@ pub struct CachedBody {
 }
 
 impl AppState {
-    pub async fn new(mut config: Config) -> Result<Self> {
+    pub async fn new(config: Config) -> Result<Self> {
         let pool = db::connect(&config.database_path).await?;
-        match db::load_system_config_values(&pool).await {
-            Ok(values) => config.apply_system_config(&values),
+        let config_store = ConfigStore::new(config)?;
+        match db::load_system_config_rows(&pool).await {
+            Ok(rows) => config_store.apply_rows(&rows),
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -64,44 +65,68 @@ impl AppState {
                 );
             }
         }
-        let clean_title_regex = Regex::new(&config.clean_title_regex)
-            .context("CLEAN_TITLE_REGEX is not a valid regular expression")?;
+        let snapshot = config_store.snapshot();
         let upstream = UpstreamClient::with_policy(
-            config.prowlarr_url.clone(),
-            config.jackett_url.clone(),
-            config.request_timeout,
-            config.upstream_retry,
-            config.upstream_max_concurrency,
+            snapshot.prowlarr_url.clone(),
+            snapshot.jackett_url.clone(),
+            snapshot.request_timeout,
+            snapshot.upstream_retry,
+            snapshot.upstream_max_concurrency,
         )?;
         let downloaders = Downloaders::new(upstream.http_client().clone());
         let result_cache = Arc::new(TtlCache::with_expiry(
-            config.indexer_result_cache_expires,
-            config.result_cache_max_entries,
+            snapshot.indexer_result_cache_expires,
+            snapshot.result_cache_max_entries,
             Expiry::AfterCreate,
         ));
         let formatting_cache = Arc::new(TtlCache::with_expiry(
-            config.cache_expires,
+            snapshot.cache_expires,
             2,
             Expiry::AfterAccess,
         ));
         let title_cache = Arc::new(TtlCache::with_expiry(
-            config.cache_expires,
-            config.cache_max_entries,
+            snapshot.cache_expires,
+            snapshot.cache_max_entries,
             Expiry::AfterAccess,
         ));
-        let auth = Arc::new(AuthState::new(config.login_enabled, config.token_expires)?);
+        let auth = Arc::new(AuthState::new(
+            snapshot.login_enabled,
+            snapshot.token_expires,
+        )?);
         Ok(Self {
-            config: Arc::new(config),
+            config: Arc::new(config_store),
             pool,
             upstream,
             downloaders,
+            prober: Prober::new()?,
             result_cache,
             formatting_cache,
             title_cache,
             sync: Arc::new(SyncState::new()),
-            clean_title_regex: Arc::new(clean_title_regex),
             auth,
         })
+    }
+
+    /// Current resolved configuration. The snapshot is replaced after a
+    /// successful `system_config` update.
+    pub fn snapshot(&self) -> ConfigSnapshot {
+        self.config.snapshot()
+    }
+
+    /// Reload `system_config`, refresh provider URLs, and clear the caches that
+    /// Java evicts on update.
+    pub async fn refresh_config(&self) -> Result<()> {
+        let rows = db::load_system_config_rows(&self.pool).await?;
+        self.config.apply_rows(&rows);
+        let snapshot = self.config.snapshot();
+        self.upstream.update_urls(
+            snapshot.prowlarr_url.as_deref(),
+            snapshot.jackett_url.as_deref(),
+        );
+        self.sync.clear_all_gates().await;
+        self.formatting_cache.clear().await;
+        self.title_cache.clear().await;
+        Ok(())
     }
 
     async fn formatting_data(&self, kind: AppKind) -> Result<Option<Arc<FormattingData>>> {
@@ -109,13 +134,31 @@ impl AppState {
         if let Some(cached) = self.formatting_cache.get(key).await {
             return Ok(cached);
         }
-        let format = match kind {
-            AppKind::Sonarr => &self.config.sonarr_indexer_format,
-            AppKind::Radarr => &self.config.radarr_indexer_format,
+        let snapshot = self.snapshot();
+        let format_key = match kind {
+            AppKind::Sonarr => "sonarrIndexerFormat",
+            AppKind::Radarr => "radarrIndexerFormat",
         };
-        let data =
-            FormattingData::load(&self.pool, kind, format, (*self.clean_title_regex).clone())
-                .await?;
+        let format = match snapshot.query_value_by_key(format_key) {
+            Ok(format) => format.to_owned(),
+            Err(error) => {
+                // Java catches the exception in `executeFormatRule` and returns
+                // the unmodified feed.
+                tracing::debug!(%kind, %error, "indexer format unavailable; leaving XML unchanged");
+                return Ok(None);
+            }
+        };
+        if snapshot.query_value_by_key("cleanTitleRegex").is_err() {
+            tracing::debug!(%kind, "clean-title regex invalid; leaving XML unchanged");
+            return Ok(None);
+        }
+        let data = FormattingData::load(
+            &self.pool,
+            kind,
+            &format,
+            (*snapshot.clean_title_regex).clone(),
+        )
+        .await?;
         let data = data.map(Arc::new);
         self.formatting_cache
             .insert(key.to_owned(), data.clone())
@@ -132,7 +175,9 @@ impl AppState {
             return Ok(cached);
         }
 
-        let mut matched = db::find_title(&self.pool, kind, title, &self.clean_title_regex).await?;
+        let snapshot = self.snapshot();
+        let mut matched =
+            db::find_title(&self.pool, kind, title, &snapshot.clean_title_regex).await?;
         if matched.is_none() {
             matched = crate::sync::sync_and_get_title(self, kind, title).await;
         }
@@ -229,7 +274,7 @@ async fn static_fallback(State(state): State<AppState>, uri: Uri) -> Response {
         return (StatusCode::BAD_REQUEST, "").into_response();
     }
 
-    let candidate = state.config.admin_ui_dir.join(relative);
+    let candidate = state.snapshot().admin_ui_dir.join(relative);
     match tokio::fs::read(&candidate).await {
         Ok(bytes) => file_response(relative, bytes),
         Err(_) => serve_index(&state).await,
@@ -237,7 +282,7 @@ async fn static_fallback(State(state): State<AppState>, uri: Uri) -> Response {
 }
 
 async fn serve_index(state: &AppState) -> Response {
-    let index = state.config.admin_ui_dir.join("index.html");
+    let index = state.snapshot().admin_ui_dir.join("index.html");
     match tokio::fs::read(&index).await {
         Ok(bytes) => file_response("index.html", bytes),
         Err(_) => (StatusCode::NOT_FOUND, "").into_response(),
@@ -464,13 +509,14 @@ async fn search_request(
     let matched = lookup.matched;
     let tmdb_titles = lookup.tmdb_titles;
 
+    let snapshot = state.snapshot();
     let steps = build_search_steps(
         kind,
         &search_key,
         &lookup_title,
         matched.as_ref(),
         &tmdb_titles,
-        state.config.min_count,
+        snapshot.min_count,
     );
     let initial_offset = params
         .get("offset")
@@ -488,7 +534,7 @@ async fn search_request(
     let base_params = params.clone();
     let result = execute_search(
         steps,
-        state.config.min_count,
+        snapshot.min_count,
         initial_offset,
         initial_limit,
         move |attempt| {

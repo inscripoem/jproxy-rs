@@ -330,9 +330,10 @@ async fn system_config_values_are_used_when_environment_is_absent() {
     env.mock
         .route_path("/api/v3/series", MockResponse::json(sonarr_series()));
     env.exec(&format!(
-        "INSERT INTO system_config (\"key\", value, valid_status) VALUES \
-         ('sonarrUrl', '{}', 1), \
-         ('sonarrApikey', 'synthetic-db-key', 1)",
+        "UPDATE system_config SET value = '{}', valid_status = 1 \
+         WHERE \"key\" = 'sonarrUrl'; \
+         UPDATE system_config SET value = 'synthetic-db-key', valid_status = 1 \
+         WHERE \"key\" = 'sonarrApikey'",
         env.mock.base_url()
     ))
     .await;
@@ -340,8 +341,9 @@ async fn system_config_values_are_used_when_environment_is_absent() {
     let config = sync_config(&env);
     assert!(config.sonarr_url.is_none());
     let state = AppState::new(config).await.unwrap();
-    assert_eq!(state.config.sonarr_url, Some(env.mock.base_url()));
-    assert!(state.config.sonarr_api_key.is_some());
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.sonarr_url, Some(env.mock.base_url()));
+    assert!(snapshot.sonarr_api_key.is_some());
 
     assert_eq!(
         sync::sync_titles_once(&state, AppKind::Sonarr)

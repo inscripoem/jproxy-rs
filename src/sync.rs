@@ -11,17 +11,14 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::app::AppState;
+use crate::config::{ConfigLookupError, ConfigSnapshot};
 use crate::db;
 use crate::models::{AppKind, MatchedTitle};
+use crate::schedule;
 use crate::text::clean_title;
 
 static RADARR_FOLDER_YEAR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r" \(\d{4}\)$").expect("static regex"));
-
-/// Java schedules titles hourly and rules daily. The ticker starts at process
-/// start rather than at the Java cron minutes (:00/:30 and 00:15/01:45).
-const TITLE_SYNC_PERIOD: Duration = Duration::from_secs(60 * 60);
-const RULE_SYNC_PERIOD: Duration = Duration::from_secs(60 * 60 * 24);
 
 const SONARR_TITLE_UPSERT: &str = "\
 INSERT INTO sonarr_title \
@@ -165,46 +162,57 @@ impl Default for SyncState {
 
 /// Start the background synchronization loops.
 ///
-/// Titles run hourly and rules daily, approximating the Java cron schedule from
-/// process start. `SYNC_ENABLED=false` or a zero `SYNC_INTERVAL` disables both
-/// background and on-demand synchronization.
+/// Each task follows the exact Java cron expression in process-local time and
+/// does not run at process start. `SYNC_ENABLED=false` or a zero
+/// `SYNC_INTERVAL` disables both background and on-demand synchronization.
 pub fn spawn(state: AppState) {
-    if !state.config.sync_enabled {
+    if !state.snapshot().sync_enabled {
         info!("background sync disabled");
         return;
     }
 
-    let title_state = state.clone();
+    let sonarr_titles = state.clone();
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(TITLE_SYNC_PERIOD);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
-            for kind in [AppKind::Sonarr, AppKind::Radarr] {
-                // Java skips the TMDB step when the Sonarr title sync throws.
-                let title_result = sync_titles_once(&title_state, kind).await;
-                if let Err(error) = &title_result {
-                    warn!(%kind, %error, "title sync failed");
+            schedule::sleep_until_next(schedule::SONARR_TITLE).await;
+            // Java's Sonarr task runs the TMDB pass only when the Sonarr title
+            // sync did not throw.
+            match sync_titles_once(&sonarr_titles, AppKind::Sonarr).await {
+                Ok(_) => {
+                    if let Err(error) = sync_tmdb_once(&sonarr_titles).await {
+                        warn!(%error, "TMDB title sync failed");
+                    }
                 }
-                if kind == AppKind::Sonarr
-                    && title_result.is_ok()
-                    && let Err(error) = sync_tmdb_once(&title_state).await
-                {
-                    warn!(%error, "TMDB title sync failed");
-                }
+                Err(error) => warn!(kind = %AppKind::Sonarr, %error, "title sync failed"),
+            }
+        }
+    });
+
+    let radarr_titles = state.clone();
+    tokio::spawn(async move {
+        loop {
+            schedule::sleep_until_next(schedule::RADARR_TITLE).await;
+            if let Err(error) = sync_titles_once(&radarr_titles, AppKind::Radarr).await {
+                warn!(kind = %AppKind::Radarr, %error, "title sync failed");
+            }
+        }
+    });
+
+    let sonarr_rules = state.clone();
+    tokio::spawn(async move {
+        loop {
+            schedule::sleep_until_next(schedule::SONARR_RULE).await;
+            if let Err(error) = sync_rules_once(&sonarr_rules, AppKind::Sonarr).await {
+                warn!(%error, "Sonarr rule sync failed");
             }
         }
     });
 
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(RULE_SYNC_PERIOD);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
-            for kind in [AppKind::Sonarr, AppKind::Radarr] {
-                if let Err(error) = sync_rules_once(&state, kind).await {
-                    warn!(%kind, %error, "rule sync failed");
-                }
+            schedule::sleep_until_next(schedule::RADARR_RULE).await;
+            if let Err(error) = sync_rules_once(&state, AppKind::Radarr).await {
+                warn!(%error, "Radarr rule sync failed");
             }
         }
     });
@@ -223,14 +231,14 @@ async fn acquire_gate(gate: &Mutex<Option<Instant>>, interval: Duration) -> bool
 }
 
 pub async fn sync_titles_once(state: &AppState, kind: AppKind) -> Result<Option<usize>> {
-    if !state.config.sync_enabled {
+    let snapshot = state.snapshot();
+    if !snapshot.sync_enabled {
         return Ok(None);
     }
-    let (base, api_key) = title_endpoint(state, kind);
-    let (Some(base), Some(api_key)) = (base, api_key) else {
+    let Some((base, api_key)) = title_endpoint(&snapshot, kind)? else {
         return Ok(None);
     };
-    if !acquire_gate(state.sync.title_gate(kind), state.config.sync_interval).await {
+    if !acquire_gate(state.sync.title_gate(kind), snapshot.sync_interval).await {
         return Ok(None);
     }
 
@@ -242,7 +250,7 @@ pub async fn sync_titles_once(state: &AppState, kind: AppKind) -> Result<Option<
         .upstream
         .http_client()
         .get(endpoint)
-        .query(&[("apikey", api_key)])
+        .query(&[("apikey", api_key.as_str())])
         .send()
         .await
         .map_err(redact_reqwest)?;
@@ -254,11 +262,11 @@ pub async fn sync_titles_once(state: &AppState, kind: AppKind) -> Result<Option<
 
     let count = match kind {
         AppKind::Sonarr => {
-            let rows = parse_sonarr_titles(&payload, &state.clean_title_regex)?;
+            let rows = parse_sonarr_titles(&payload, &snapshot.clean_title_regex)?;
             upsert_sonarr_titles(&state.pool, &rows).await?
         }
         AppKind::Radarr => {
-            let rows = parse_radarr_titles(&payload, &state.clean_title_regex)?;
+            let rows = parse_radarr_titles(&payload, &snapshot.clean_title_regex)?;
             upsert_radarr_titles(&state.pool, &rows).await?
         }
     };
@@ -268,14 +276,17 @@ pub async fn sync_titles_once(state: &AppState, kind: AppKind) -> Result<Option<
 }
 
 pub async fn sync_rules_once(state: &AppState, kind: AppKind) -> Result<Option<usize>> {
-    if !state.config.sync_enabled {
+    let snapshot = state.snapshot();
+    if !snapshot.sync_enabled {
         return Ok(None);
     }
-    let locations = state.config.rule_locations();
+    // Java reads both keys through `queryValueByKey`, which throws on an
+    // invalid row; the scheduled task catches and logs that failure.
+    let locations = snapshot.rule_locations();
     if locations.is_empty() {
         return Ok(None);
     }
-    let configured_authors = state.config.rule_sync_authors();
+    let configured_authors = snapshot.query_value_by_key("ruleSyncAuthors")?;
     if configured_authors.trim().is_empty() {
         return Ok(None);
     }
@@ -315,28 +326,31 @@ pub async fn sync_rules_once(state: &AppState, kind: AppKind) -> Result<Option<u
 }
 
 pub async fn sync_tmdb_once(state: &AppState) -> Result<Option<usize>> {
-    if !state.config.sync_enabled {
+    let snapshot = state.snapshot();
+    if !snapshot.sync_enabled {
         return Ok(None);
     }
-    let Some(api_key) = state
-        .config
-        .tmdb_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-    else {
-        return Ok(None);
-    };
+    // Java's caller first computes the need-sync list; an empty list returns
+    // without reading the API key at all.
     let tvdb_ids = db::list_tvdb_ids_needing_tmdb(&state.pool).await?;
     if tvdb_ids.is_empty() {
         return Ok(None);
     }
-    if !acquire_gate(&state.sync.tmdb_gate, state.config.sync_interval).await {
+    // Java checks the interval gate before reading any configuration value.
+    if !acquire_gate(&state.sync.tmdb_gate, snapshot.sync_interval).await {
         return Ok(None);
     }
 
-    let base = state.config.tmdb_url().trim_end_matches('/').to_owned();
-    let languages = state.config.sonarr_languages();
+    let languages = [
+        snapshot.query_value_by_key("sonarrLanguage1")?.to_owned(),
+        snapshot.query_value_by_key("sonarrLanguage2")?.to_owned(),
+    ];
+    let base = snapshot.query_value_by_key("tmdbUrl")?;
+    let base = base.trim_end_matches('/').to_owned();
+    let api_key = snapshot.query_value_by_key("tmdbApikey")?;
+    if api_key.trim().is_empty() {
+        return Ok(None);
+    }
     let mut seen = HashSet::new();
     let mut rows = Vec::new();
     for tvdb_id in tvdb_ids {
@@ -372,7 +386,7 @@ pub async fn sync_and_get_title(
     kind: AppKind,
     title: &str,
 ) -> Option<MatchedTitle> {
-    let timeout = state.config.on_demand_sync_timeout;
+    let timeout = state.snapshot().on_demand_sync_timeout;
     match tokio::time::timeout(timeout, sync_and_get_title_inner(state, kind, title)).await {
         Ok(result) => result,
         Err(_) => {
@@ -387,15 +401,16 @@ async fn sync_and_get_title_inner(
     kind: AppKind,
     title: &str,
 ) -> Option<MatchedTitle> {
-    if !state.config.sync_enabled || state.config.sync_interval.is_zero() {
+    let snapshot = state.snapshot();
+    if !snapshot.sync_enabled || snapshot.sync_interval.is_zero() {
         return None;
     }
-    if !state.config.title_sync_configured(kind) {
+    if !snapshot.title_sync_configured(kind) {
         return None;
     }
 
     let _guard = state.sync.title_lock(kind).lock().await;
-    match db::find_title(&state.pool, kind, title, &state.clean_title_regex).await {
+    match db::find_title(&state.pool, kind, title, &snapshot.clean_title_regex).await {
         Ok(Some(matched)) => return Some(matched),
         Ok(None) => {}
         Err(error) => {
@@ -414,7 +429,7 @@ async fn sync_and_get_title_inner(
         }
     }
 
-    match db::find_title(&state.pool, kind, title, &state.clean_title_regex).await {
+    match db::find_title(&state.pool, kind, title, &snapshot.clean_title_regex).await {
         Ok(matched) => matched,
         Err(error) => {
             warn!(%kind, %error, "title re-query after on-demand sync failed");
@@ -423,17 +438,32 @@ async fn sync_and_get_title_inner(
     }
 }
 
-fn title_endpoint(state: &AppState, kind: AppKind) -> (Option<&str>, Option<&str>) {
-    match kind {
-        AppKind::Sonarr => (
-            state.config.sonarr_url.as_deref(),
-            state.config.sonarr_api_key.as_deref(),
-        ),
-        AppKind::Radarr => (
-            state.config.radarr_url.as_deref(),
-            state.config.radarr_api_key.as_deref(),
-        ),
+/// Java `queryValueByKey` for `/api/v3/{series|movie}`.
+///
+/// An invalid row is an error (Java throws `SystemConfigException`); a missing
+/// or blank value means the integration is not configured.
+fn title_endpoint(
+    snapshot: &ConfigSnapshot,
+    kind: AppKind,
+) -> Result<Option<(String, String)>, ConfigLookupError> {
+    let (url_key, api_key_key) = match kind {
+        AppKind::Sonarr => ("sonarrUrl", "sonarrApikey"),
+        AppKind::Radarr => ("radarrUrl", "radarrApikey"),
+    };
+    let base = match snapshot.query_value_by_key(url_key) {
+        Ok(value) => value,
+        Err(ConfigLookupError::Missing(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let api_key = match snapshot.query_value_by_key(api_key_key) {
+        Ok(value) => value,
+        Err(ConfigLookupError::Missing(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if base.trim().is_empty() || api_key.trim().is_empty() {
+        return Ok(None);
     }
+    Ok(Some((base.trim().to_owned(), api_key.trim().to_owned())))
 }
 
 async fn fetch_author_list(state: &AppState, locations: &[String]) -> Result<Vec<String>> {

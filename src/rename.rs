@@ -14,13 +14,13 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use crate::app::AppState;
 use crate::downloader::VIDEO_AND_SUBTITLE_EXTENSION_REGEX;
 use crate::formatting::RenameFormatter;
 use crate::models::AppKind;
+use crate::schedule;
 
 static EPISODE_IN_FILE_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:S\d+|\b|\s)E\d+$").expect("static regex"));
@@ -70,56 +70,34 @@ struct ItemOutcome {
 /// Start the login and rename schedules.
 ///
 /// Java cron cadence from `application-prod.yml`:
-/// downloader login every 30 minutes, Sonarr rename every 30 seconds, Radarr
-/// rename every minute. Login also runs once at startup (`CommandLineRunner`).
-/// Cron tasks do not fire at startup, so the first rename tick is skipped.
+/// downloader login every 30 minutes at `:00` (plus one startup run from
+/// `CommandLineRunner`), Sonarr rename at seconds `0`/`30` of every minute, and
+/// Radarr rename at second `0` of every minute. Cron tasks do not fire at
+/// startup, so the first rename tick is the next wall-clock boundary.
 pub fn spawn(state: AppState) {
-    if state.config.downloaders_configured() {
-        let login_state = state.clone();
-        tokio::spawn(async move {
+    let login_state = state.clone();
+    tokio::spawn(async move {
+        let report = login_once(&login_state).await;
+        debug!(?report, "initial downloader login pass complete");
+        loop {
+            schedule::sleep_until_next(schedule::DOWNLOADER_LOGIN).await;
             let report = login_once(&login_state).await;
-            debug!(?report, "initial downloader login pass complete");
-            let interval = login_state.config.downloader_login_interval;
-            if interval.is_zero() {
-                return;
-            }
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            // The interval's first tick is immediate; the startup login above
-            // already covered it.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let report = login_once(&login_state).await;
-                debug!(?report, "scheduled downloader login pass complete");
-            }
-        });
-    }
+            debug!(?report, "scheduled downloader login pass complete");
+        }
+    });
 
     spawn_rename(state.clone(), AppKind::Sonarr);
     spawn_rename(state, AppKind::Radarr);
 }
 
 fn spawn_rename(state: AppState, kind: AppKind) {
-    if !state.config.downloaders_configured() || !state.config.title_sync_configured(kind) {
-        return;
-    }
-    let interval = match kind {
-        AppKind::Sonarr => state.config.sonarr_rename_interval,
-        AppKind::Radarr => state.config.radarr_rename_interval,
+    let schedule = match kind {
+        AppKind::Sonarr => schedule::SONARR_RENAME,
+        AppKind::Radarr => schedule::RADARR_RENAME,
     };
-    if interval.is_zero() {
-        info!(%kind, "rename task disabled");
-        return;
-    }
-
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // Java's @Scheduled cron does not run at process start.
-        ticker.tick().await;
         loop {
-            ticker.tick().await;
+            schedule::sleep_until_next(schedule).await;
             match rename_once(&state, kind).await {
                 Ok(report) => debug!(%kind, ?report, "rename pass complete"),
                 Err(error) => warn!(%kind, %error, "rename pass failed"),
@@ -129,20 +107,22 @@ fn spawn_rename(state: AppState, kind: AppKind) {
 }
 
 /// Log in to both configured downloaders. Failures are non-fatal and are
-/// retried by the next scheduled pass.
+/// retried by the next scheduled pass. Invalid `system_config` rows are treated
+/// like Java's caught `SystemConfigException`: that downloader is skipped.
 pub async fn login_once(state: &AppState) -> LoginReport {
     let mut report = LoginReport::default();
+    let snapshot = state.snapshot();
 
-    if let (Some(url), Some(username), Some(password)) = (
-        state.config.qbittorrent_url.as_deref().map(str::trim),
-        state.config.qbittorrent_username.as_deref(),
-        state.config.qbittorrent_password.as_deref(),
-    ) && !url.is_empty()
-    {
+    if let Some((url, username, password)) = downloader_credentials(
+        &snapshot,
+        "qbittorrentUrl",
+        "qbittorrentUsername",
+        "qbittorrentPassword",
+    ) {
         report.qbittorrent = state
             .downloaders
             .qbittorrent
-            .login_with(url, username, password)
+            .login_with(&url, &username, &password)
             .await;
         if report.qbittorrent {
             info!("qBittorrent logged in");
@@ -151,16 +131,16 @@ pub async fn login_once(state: &AppState) -> LoginReport {
         }
     }
 
-    if let (Some(url), Some(username), Some(password)) = (
-        state.config.transmission_url.as_deref().map(str::trim),
-        state.config.transmission_username.as_deref(),
-        state.config.transmission_password.as_deref(),
-    ) && !url.is_empty()
-    {
+    if let Some((url, username, password)) = downloader_credentials(
+        &snapshot,
+        "transmissionUrl",
+        "transmissionUsername",
+        "transmissionPassword",
+    ) {
         report.transmission = state
             .downloaders
             .transmission
-            .login_with(url, username, password)
+            .login_with(&url, &username, &password)
             .await;
         if report.transmission {
             info!("Transmission logged in");
@@ -170,6 +150,30 @@ pub async fn login_once(state: &AppState) -> LoginReport {
     }
 
     report
+}
+
+fn downloader_credentials(
+    snapshot: &crate::config::ConfigSnapshot,
+    url_key: &str,
+    username_key: &str,
+    password_key: &str,
+) -> Option<(String, String, String)> {
+    let read = |key: &str| match snapshot.query_value_by_key(key) {
+        Ok(value) => Some(value.to_owned()),
+        Err(error) => {
+            debug!(%key, %error, "downloader configuration unavailable");
+            None
+        }
+    };
+    let url = read(url_key)?;
+    if url.trim().is_empty() {
+        return None;
+    }
+    Some((
+        url.trim().to_owned(),
+        read(username_key)?,
+        read(password_key)?,
+    ))
 }
 
 pub async fn sonarr_rename_once(state: &AppState) -> Result<RenameReport> {
@@ -187,7 +191,13 @@ async fn rename_once(state: &AppState, kind: AppKind) -> Result<RenameReport> {
         return Ok(report);
     }
 
-    let history = fetch_history(state, kind).await?;
+    let history = match fetch_history(state, kind).await? {
+        Some(history) => history,
+        None => {
+            report.skipped = true;
+            return Ok(report);
+        }
+    };
     report.history_items = history.len();
 
     let formatter = match kind {
@@ -293,7 +303,7 @@ async fn process_item(
     }
     info!(%hash, %source_title, "qBittorrent torrent renamed");
 
-    if !state.config.rename_file {
+    if !state.snapshot().rename_file {
         debug!("file rename disabled");
         return Ok(outcome);
     }
@@ -478,23 +488,32 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year + i64::from(month <= 2), month as u32, day as u32)
 }
 
-async fn fetch_history(state: &AppState, kind: AppKind) -> Result<Vec<HistoryItem>> {
-    let (base, api_key, fallback) = match kind {
-        AppKind::Sonarr => (
-            state.config.sonarr_url.as_deref(),
-            state.config.sonarr_api_key.as_deref(),
-            state.config.sonarr_rename_fallback,
-        ),
-        AppKind::Radarr => (
-            state.config.radarr_url.as_deref(),
-            state.config.radarr_api_key.as_deref(),
-            state.config.radarr_rename_fallback,
-        ),
+/// Fetch history, or `None` when the arr configuration is invalid or missing.
+/// Java logs the caught `SystemConfigException` at debug level and returns.
+async fn fetch_history(state: &AppState, kind: AppKind) -> Result<Option<Vec<HistoryItem>>> {
+    let snapshot = state.snapshot();
+    let (url_key, api_key_key, fallback) = match kind {
+        AppKind::Sonarr => ("sonarrUrl", "sonarrApikey", snapshot.sonarr_rename_fallback),
+        AppKind::Radarr => ("radarrUrl", "radarrApikey", snapshot.radarr_rename_fallback),
     };
-    let (Some(base), Some(api_key)) = (base, api_key) else {
-        bail!("{kind} URL or API key is not configured");
+    let (base, api_key) = match (
+        snapshot.query_value_by_key(url_key),
+        snapshot.query_value_by_key(api_key_key),
+    ) {
+        (Ok(base), Ok(api_key)) if !base.trim().is_empty() && !api_key.trim().is_empty() => {
+            (base.trim().to_owned(), api_key.trim().to_owned())
+        }
+        (url, key) => {
+            if let Err(error) = url {
+                debug!(%kind, %error, "rename skipped");
+            }
+            if let Err(error) = key {
+                debug!(%kind, %error, "rename skipped");
+            }
+            return Ok(None);
+        }
     };
-    let base = base.trim().trim_end_matches('/');
+    let base = base.trim_end_matches('/');
     let date = history_since(fallback.as_secs() / 60);
     let response = state
         .upstream
@@ -503,7 +522,7 @@ async fn fetch_history(state: &AppState, kind: AppKind) -> Result<Vec<HistoryIte
         .query(&[
             ("eventType", "1"),
             ("date", date.as_str()),
-            ("apikey", api_key),
+            ("apikey", api_key.as_str()),
         ])
         .send()
         .await
@@ -514,9 +533,11 @@ async fn fetch_history(state: &AppState, kind: AppKind) -> Result<Vec<HistoryIte
     }
     let payload = response.json::<Value>().await.map_err(http_error)?;
     if payload.is_null() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
-    serde_json::from_value(payload).context("parse history response")
+    serde_json::from_value(payload)
+        .context("parse history response")
+        .map(Some)
 }
 
 fn http_error(error: reqwest::Error) -> anyhow::Error {

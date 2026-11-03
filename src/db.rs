@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -7,7 +6,7 @@ use regex::Regex;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
-use crate::config::SystemConfigValues;
+use crate::config::ConfigRow;
 use crate::models::{AppKind, MatchedTitle, Rule, TitleCandidate};
 use crate::text::{clean_title, remove_season};
 
@@ -61,31 +60,33 @@ pub async fn healthcheck(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-/// Load the whitelisted `system_config` rows.
+/// Load every whitelisted `system_config` row, including invalid rows.
 ///
-/// Downloader credentials are selected only so the login tasks can use them.
-/// Values are kept in memory and are not logged by the caller. `system_user`
-/// rows are never selected.
-pub async fn load_system_config_values(pool: &SqlitePool) -> Result<SystemConfigValues> {
+/// The caller applies valid rows and records invalid ones so a strict
+/// `queryValueByKey` read can fail like Java. Downloader credentials are
+/// selected only so the login tasks can use them and are never logged.
+/// `system_user` rows are never selected.
+pub async fn load_system_config_rows(pool: &SqlitePool) -> Result<Vec<ConfigRow>> {
     let keys = crate::config::Config::system_config_keys();
     let placeholders = vec!["?"; keys.len()].join(",");
     let sql = format!(
-        "SELECT \"key\", value FROM system_config \
-         WHERE valid_status = 1 AND \"key\" IN ({placeholders})"
+        "SELECT \"key\", value, valid_status FROM system_config \
+         WHERE \"key\" IN ({placeholders}) ORDER BY id"
     );
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for key in keys {
         query = query.bind(*key);
     }
     let rows = query.fetch_all(pool).await?;
-    let mut values = HashMap::new();
-    for row in rows {
-        let key: String = row.try_get("key")?;
-        if let Some(value) = row.try_get::<Option<String>, _>("value")? {
-            values.insert(key, value);
-        }
-    }
-    Ok(SystemConfigValues::new(values))
+    rows.into_iter()
+        .map(|row| -> Result<ConfigRow> {
+            Ok(ConfigRow {
+                key: row.try_get("key")?,
+                value: row.try_get("value")?,
+                valid_status: row.try_get("valid_status")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,8 +395,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_config_loader_reads_only_whitelisted_keys() {
+    async fn system_config_loader_reads_only_whitelisted_keys_with_validity() {
         let pool = connect_memory().await.unwrap();
+        sqlx::query("DELETE FROM system_config")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO system_config (\"key\", value, valid_status) VALUES \
              ('sonarrUrl', 'http://synthetic.invalid', 1), \
@@ -409,16 +414,30 @@ mod tests {
         .await
         .unwrap();
 
-        let values = load_system_config_values(&pool).await.unwrap();
-        assert_eq!(values.get("sonarrUrl"), Some("http://synthetic.invalid"));
-        assert_eq!(values.get("sonarrApikey"), Some("synthetic-key"));
-        assert_eq!(values.get("ruleSyncAuthors"), Some("alice"));
+        let rows = load_system_config_rows(&pool).await.unwrap();
+        let by_key = |key: &str| rows.iter().find(|row| row.key == key);
         assert_eq!(
-            values.get("qbittorrentPassword"),
+            by_key("sonarrUrl").and_then(|row| row.value.as_deref()),
+            Some("http://synthetic.invalid")
+        );
+        assert_eq!(
+            by_key("sonarrApikey").and_then(|row| row.value.as_deref()),
+            Some("synthetic-key")
+        );
+        assert_eq!(
+            by_key("ruleSyncAuthors").and_then(|row| row.value.as_deref()),
+            Some("alice")
+        );
+        assert_eq!(
+            by_key("qbittorrentPassword").and_then(|row| row.value.as_deref()),
             Some("synthetic-downloader-password")
         );
-        assert_eq!(values.get("unlistedKey"), None);
-        assert_eq!(values.get("tmdbApikey"), None);
+        assert!(by_key("unlistedKey").is_none());
+        assert_eq!(
+            by_key("tmdbApikey").map(|row| row.valid_status),
+            Some(0),
+            "invalid rows are loaded so strict reads can fail"
+        );
     }
 
     #[tokio::test]

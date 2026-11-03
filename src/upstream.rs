@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -34,8 +34,8 @@ impl Default for RetryPolicy {
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: Client,
-    prowlarr_url: Option<String>,
-    jackett_url: Option<String>,
+    prowlarr_url: Arc<RwLock<Option<String>>>,
+    jackett_url: Arc<RwLock<Option<String>>>,
     policy: RetryPolicy,
     limiter: Arc<Semaphore>,
 }
@@ -159,11 +159,24 @@ impl UpstreamClient {
             .context("build upstream HTTP client")?;
         Ok(Self {
             client,
-            prowlarr_url: clean_base(prowlarr_url),
-            jackett_url: clean_base(jackett_url),
+            prowlarr_url: Arc::new(RwLock::new(clean_base(prowlarr_url))),
+            jackett_url: Arc::new(RwLock::new(clean_base(jackett_url))),
             policy,
             limiter: Arc::new(Semaphore::new(max_concurrency.max(1))),
         })
+    }
+
+    /// Apply new provider URLs without restarting. Called after a successful
+    /// `system_config` update; blank values disable the provider.
+    pub fn update_urls(&self, prowlarr_url: Option<&str>, jackett_url: Option<&str>) {
+        let write = |slot: &RwLock<Option<String>>, value: Option<&str>| {
+            *slot
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                clean_base(value.map(str::to_owned));
+        };
+        write(&self.prowlarr_url, prowlarr_url);
+        write(&self.jackett_url, jackett_url);
     }
 
     pub fn has_provider(&self, provider: Provider) -> bool {
@@ -174,11 +187,14 @@ impl UpstreamClient {
         &self.client
     }
 
-    pub fn base_url(&self, provider: Provider) -> Option<&str> {
-        match provider {
-            Provider::Prowlarr => self.prowlarr_url.as_deref(),
-            Provider::Jackett => self.jackett_url.as_deref(),
-        }
+    pub fn base_url(&self, provider: Provider) -> Option<String> {
+        let slot = match provider {
+            Provider::Prowlarr => &self.prowlarr_url,
+            Provider::Jackett => &self.jackett_url,
+        };
+        slot.read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Fetch one indexer response, applying the configured concurrency bound and
@@ -193,7 +209,7 @@ impl UpstreamClient {
         let base = self
             .base_url(provider)
             .ok_or(UpstreamError::NotConfigured(provider))?;
-        let url = build_upstream_url(base, provider, indexer_id, raw_query)
+        let url = build_upstream_url(&base, provider, indexer_id, raw_query)
             .map_err(|error| UpstreamError::InvalidIndexerId(error.to_string()))?;
         self.fetch_url(&url).await
     }

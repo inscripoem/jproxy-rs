@@ -555,22 +555,104 @@ async fn example_query_formats_known_and_unknown_titles() {
 }
 
 #[tokio::test]
-async fn system_config_update_persists_validity_and_normalizes_transmission() {
+async fn system_config_update_probes_endpoints_and_applies_immediately() {
     let env = TestEnv::start().await;
-    let router = env.router_with(auth_config(&env, false)).await;
+    let sonarr = common::MockHttp::start().await;
+    let radarr = common::MockHttp::start().await;
+    let tmdb = common::MockHttp::start().await;
+    let qbittorrent = common::MockHttp::start().await;
+    let transmission = common::MockHttp::start().await;
+    let jackett = common::MockHttp::start().await;
+
+    sonarr.route_sequence(
+        "GET",
+        "/api/v3/health",
+        vec![
+            common::MockHttpReply::status(401),
+            // The second update validates the key and enables hot-reloaded sync.
+            common::MockHttpReply::ok("[]"),
+        ],
+    );
+    sonarr.route(
+        "GET",
+        "/api/v3/series",
+        common::MockHttpReply::json(
+            serde_json::json!([{
+                "id": 7,
+                "tvdbId": 100,
+                "title": "Main Show",
+                "titleSlug": "main-show",
+                "monitored": true,
+                "alternateTitles": []
+            }])
+            .to_string(),
+        ),
+    );
+    radarr.route("GET", "/api/v3/health", common::MockHttpReply::ok("[]"));
+    tmdb.route(
+        "GET",
+        "/3/movie/550",
+        common::MockHttpReply::json(r#"{"status_message":"Invalid API key"}"#),
+    );
+    qbittorrent.route("GET", "/", common::MockHttpReply::ok(""));
+    qbittorrent.route(
+        "POST",
+        "/api/v2/auth/login",
+        common::MockHttpReply::ok("Ok.").with_header("set-cookie", "SID=synthetic-session; path=/"),
+    );
+    transmission.route("GET", "/transmission/rpc", common::MockHttpReply::ok(""));
+    transmission.route(
+        "POST",
+        "/transmission/rpc",
+        common::MockHttpReply::status(409)
+            .with_header("x-transmission-session-id", "synthetic-session-id"),
+    );
+    // An HTTP error response still proves the URL is reachable, like Java.
+    jackett.route("GET", "/", common::MockHttpReply::status(500));
+    env.mock
+        .route_path("/sonarr@alice.json", common::MockResponse::json(r#"[]"#));
+
+    let mut config = auth_config(&env, false);
+    config.sync_enabled = true;
+    config.sync_interval = std::time::Duration::from_secs(60);
+    let state = jproxy_rs::app::AppState::new(config).await.unwrap();
+    let router = jproxy_rs::app::router(state.clone());
     let token = login(&router, "Anonymous", "Anonymous").await.body;
 
     let query = get_auth(&router, "/api/system/config/query", &token).await;
-    assert_eq!(query.status, 200);
     let mut rows: Vec<Value> = serde_json::from_str(&query.body).unwrap();
+    // The upstream seed does not contain the optional rule location rows.
+    if !rows.iter().any(|row| row["key"] == "ruleLocation") {
+        rows.push(json!({
+            "key": "ruleLocation",
+            "value": env.mock.base_url(),
+            "validStatus": 1
+        }));
+    }
     for row in &mut rows {
         match row["key"].as_str().unwrap() {
-            "sonarrUrl" => row["value"] = Value::from("http://sonarr.invalid"),
-            "sonarrApikey" => row["value"] = Value::from(""),
+            "sonarrUrl" => row["value"] = Value::from(sonarr.base_url()),
+            "sonarrApikey" => row["value"] = Value::from("synthetic-sonarr-key"),
+            "sonarrIndexerFormat" => row["value"] = Value::from("{title}"),
+            "radarrUrl" => row["value"] = Value::from(radarr.base_url()),
+            "radarrApikey" => row["value"] = Value::from("synthetic-radarr-key"),
+            "radarrIndexerFormat" => row["value"] = Value::from("{title} {year} {group}"),
+            "tmdbUrl" => row["value"] = Value::from(tmdb.base_url()),
+            "tmdbApikey" => row["value"] = Value::from("synthetic-tmdb-key"),
+            "jackettUrl" => row["value"] = Value::from(jackett.base_url()),
+            // Connection refused: no listener on this local port.
+            "prowlarrUrl" => row["value"] = Value::from("http://127.0.0.1:1"),
+            "qbittorrentUrl" => row["value"] = Value::from(qbittorrent.base_url()),
+            "qbittorrentUsername" => row["value"] = Value::from("synthetic-qb-user"),
+            "qbittorrentPassword" => row["value"] = Value::from("synthetic-qb-pass"),
             "transmissionUrl" => {
-                row["value"] = Value::from("http://transmission.invalid/transmission/web/")
+                row["value"] = Value::from(format!("{}/transmission/web/", transmission.base_url()))
             }
+            "transmissionUsername" => row["value"] = Value::from("synthetic-tr-user"),
+            "transmissionPassword" => row["value"] = Value::from("synthetic-tr-pass"),
             "cleanTitleRegex" => row["value"] = Value::from("("),
+            "ruleLocation" => row["value"] = Value::from(env.mock.base_url()),
+            "ruleSyncAuthors" => row["value"] = Value::from("alice"),
             _ => {}
         }
     }
@@ -591,13 +673,97 @@ async fn system_config_update_persists_validity_and_normalizes_transmission() {
             .find(|row| row["key"] == key)
             .unwrap_or_else(|| panic!("missing config key {key}"))
     };
+    // 401 from the health endpoint: URL valid, API key invalid.
     assert_eq!(by_key("sonarrUrl")["validStatus"], 1);
     assert_eq!(by_key("sonarrApikey")["validStatus"], 0);
+    // A successful health response validates both.
+    assert_eq!(by_key("radarrUrl")["validStatus"], 1);
+    assert_eq!(by_key("radarrApikey")["validStatus"], 1);
+    // TMDB "Invalid API key" only validates the URL.
+    assert_eq!(by_key("tmdbUrl")["validStatus"], 1);
+    assert_eq!(by_key("tmdbApikey")["validStatus"], 0);
+    // Downloader URL checks followed by a login set all three statuses.
+    for key in [
+        "qbittorrentUrl",
+        "qbittorrentUsername",
+        "qbittorrentPassword",
+        "transmissionUrl",
+        "transmissionUsername",
+        "transmissionPassword",
+    ] {
+        assert_eq!(by_key(key)["validStatus"], 1, "key {key}");
+    }
+    // HTTP errors count as a reachable URL; connection failure does not.
+    assert_eq!(by_key("jackettUrl")["validStatus"], 1);
+    assert_eq!(by_key("prowlarrUrl")["validStatus"], 0);
+    // Indexer formats and the regex are compiled/checked without network I/O.
+    assert_eq!(by_key("sonarrIndexerFormat")["validStatus"], 0);
+    assert_eq!(by_key("radarrIndexerFormat")["validStatus"], 1);
+    assert_eq!(by_key("cleanTitleRegex")["validStatus"], 0);
+    // Java normalization: one trailing slash, strip /transmission/web.
     assert_eq!(
         by_key("transmissionUrl")["value"],
-        "http://transmission.invalid/transmission/rpc"
+        format!("{}/transmission/rpc", transmission.base_url())
     );
-    assert_eq!(by_key("cleanTitleRegex")["validStatus"], 0);
+
+    // The probes used the submitted credentials.
+    assert_eq!(
+        qbittorrent.requests_for("POST", "/api/v2/auth/login").len(),
+        1
+    );
+    assert_eq!(
+        transmission.requests_for("POST", "/transmission/rpc").len(),
+        1
+    );
+    assert!(state.downloaders.qbittorrent.is_login().await);
+    assert!(state.downloaders.transmission.is_login().await);
+
+    // The second probe now reports a valid Sonarr API key, which is what the
+    // title sync requires through the strict `queryValueByKey` path.
+    let update = post_json_auth(
+        &router,
+        "/api/system/config/update",
+        &token,
+        &serde_json::to_string(&rows).unwrap(),
+    )
+    .await;
+    assert_eq!(update.status, 200);
+    let query = get_auth(&router, "/api/system/config/query", &token).await;
+    let rows: Vec<Value> = serde_json::from_str(&query.body).unwrap();
+    let sonarr_key = rows
+        .iter()
+        .find(|row| row["key"] == "sonarrApikey")
+        .unwrap();
+    assert_eq!(sonarr_key["validStatus"], 1);
+
+    // Hot reload: a title sync now uses the newly stored Sonarr URL without a
+    // process restart.
+    let count = jproxy_rs::sync::sync_titles_once(&state, jproxy_rs::models::AppKind::Sonarr)
+        .await
+        .unwrap();
+    assert_eq!(count, Some(2));
+    assert_eq!(sonarr.requests_for("GET", "/api/v3/series").len(), 1);
+
+    // Rule location and author list also apply immediately.
+    let count = jproxy_rs::sync::sync_rules_once(&state, jproxy_rs::models::AppKind::Sonarr)
+        .await
+        .unwrap();
+    assert_eq!(count, Some(0));
+    assert_eq!(env.mock.recorded_paths(), vec!["/sonarr@alice.json"]);
+
+    let snapshot = state.snapshot();
+    assert_eq!(
+        snapshot.query_value_by_key("cleanTitleRegex"),
+        Err(jproxy_rs::config::ConfigLookupError::Invalid(
+            "cleanTitleRegex".to_owned()
+        ))
+    );
+    assert_eq!(
+        snapshot.query_value_by_key("sonarrIndexerFormat"),
+        Err(jproxy_rs::config::ConfigLookupError::Invalid(
+            "sonarrIndexerFormat".to_owned()
+        ))
+    );
 
     let clear = post_json_auth(
         &router,
@@ -621,6 +787,193 @@ async fn system_config_update_persists_validity_and_normalizes_transmission() {
             .status,
         200
     );
+}
+
+#[tokio::test]
+async fn version_endpoint_compares_the_github_release_tag() {
+    let env = TestEnv::start().await;
+    let release_path = "/repos/LuckyPuppy514/jproxy/releases/latest";
+    env.mock.route_path(
+        release_path,
+        common::MockResponse::json(r#"{"tag_name":"v0.1.0"}"#),
+    );
+    let router = env.router_with(auth_config(&env, false)).await;
+    let token = login(&router, "Anonymous", "Anonymous").await.body;
+
+    let version = get_auth(&router, "/api/system/config/version", &token).await;
+    assert_eq!(version.status, 200);
+    assert_eq!(version.body, "0.1.0");
+
+    env.mock.route_path(
+        release_path,
+        common::MockResponse::json(r#"{"tag_name":"v9.9.9"}"#),
+    );
+    let version = get_auth(&router, "/api/system/config/version", &token).await;
+    assert_eq!(version.body, "0.1.0 🚨");
+
+    env.mock
+        .route_path(release_path, common::MockResponse::status(500));
+    let version = get_auth(&router, "/api/system/config/version", &token).await;
+    assert_eq!(version.body, "0.1.0");
+}
+
+#[tokio::test]
+async fn config_query_runs_the_sonarr_rename_task_first() {
+    let env = TestEnv::start().await;
+    let arr = common::MockHttp::start().await;
+    let qbittorrent = common::MockHttp::start().await;
+    arr.route(
+        "GET",
+        "/api/v3/history/since",
+        common::MockHttpReply::json("[]"),
+    );
+    qbittorrent.route(
+        "POST",
+        "/api/v2/auth/login",
+        common::MockHttpReply::ok("Ok.").with_header("set-cookie", "SID=synthetic-session; path=/"),
+    );
+
+    let mut config = auth_config(&env, false);
+    config.sonarr_url = Some(arr.base_url());
+    config.sonarr_api_key = Some("synthetic-sonarr-key".to_owned());
+    config.qbittorrent_url = Some(qbittorrent.base_url());
+    config.qbittorrent_username = Some("synthetic-qb-user".to_owned());
+    config.qbittorrent_password = Some("synthetic-qb-pass".to_owned());
+    let state = jproxy_rs::app::AppState::new(config).await.unwrap();
+    assert!(jproxy_rs::rename::login_once(&state).await.qbittorrent);
+
+    let router = jproxy_rs::app::router(state);
+    let token = login(&router, "Anonymous", "Anonymous").await.body;
+    let response = get_auth(&router, "/api/system/config/query", &token).await;
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        arr.requests_for("GET", "/api/v3/history/since").len(),
+        1,
+        "the config query must run the Sonarr rename task"
+    );
+}
+
+#[tokio::test]
+async fn invalid_config_status_is_an_error_but_proxy_traffic_degrades() {
+    let env = TestEnv::start().await;
+    env.exec(
+        "UPDATE system_config SET valid_status = 0 \
+         WHERE \"key\" IN ('sonarrIndexerFormat', 'cleanTitleRegex')",
+    )
+    .await;
+    let mut config = auth_config(&env, false);
+    config.prowlarr_url = Some(env.mock.base_url());
+    config.sync_enabled = true;
+    config.sync_interval = std::time::Duration::from_secs(60);
+    let state = jproxy_rs::app::AppState::new(config).await.unwrap();
+
+    let snapshot = state.snapshot();
+    assert!(matches!(
+        snapshot.query_value_by_key("sonarrIndexerFormat"),
+        Err(jproxy_rs::config::ConfigLookupError::Invalid(_))
+    ));
+    assert!(matches!(
+        snapshot.query_value_by_key("cleanTitleRegex"),
+        Err(jproxy_rs::config::ConfigLookupError::Invalid(_))
+    ));
+    assert!(
+        jproxy_rs::sync::sync_titles_once(&state, jproxy_rs::models::AppKind::Sonarr)
+            .await
+            .is_err(),
+        "an invalid row must fail the strict read, like SystemConfigException"
+    );
+
+    // Java's `executeFormatRule` catches the configuration exception and
+    // returns the upstream XML unchanged; the proxy must not fail.
+    let router = jproxy_rs::app::router(state);
+    let token = login(&router, "Anonymous", "Anonymous").await.body;
+    let sync = post_json_auth(&router, "/api/sonarr/title/sync", &token, "").await;
+    assert_eq!(sync.status, 500);
+    let response = get(
+        &router,
+        "/sonarr/prowlarr/1/api?t=tvsearch&q=Unknown+Show&limit=100",
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("<channel>"));
+}
+
+#[tokio::test]
+async fn example_pagination_handles_pages_past_the_end() {
+    let env = TestEnv::start().await;
+    env.exec(
+        "INSERT INTO sonarr_title (id, tvdb_id, sno, main_title, title, clean_title, \
+         season_number, monitored) VALUES \
+         (1, 100, 0, 'Main Show', 'Main Show', 'main show', -1, 1); \
+         INSERT INTO sonarr_rule (id, token, priority, regex, replacement, offset, example, \
+         remark, author, valid_status) VALUES \
+         ('title-rule', 'title', 900, '.*(\\b|\\s){cleanTitle}(\\b|\\s).*', '{mainTitle}', 0, \
+         'example', 'remark', 'author', 1); \
+         INSERT INTO sonarr_example (hash, original_text, valid_status) VALUES \
+         ('h1', 'Main Show S01E01', 1), \
+         ('h2', 'Main Show S02E02', 1); \
+         UPDATE system_config SET value = '{title}' WHERE \"key\" = 'sonarrIndexerFormat'",
+    )
+    .await;
+    let router = env.router_with(auth_config(&env, false)).await;
+    let token = login(&router, "Anonymous", "Anonymous").await.body;
+
+    // Unfiltered MyBatis-Plus pagination resets an out-of-range page to one.
+    let page = get_auth(
+        &router,
+        "/api/sonarr/example/query?current=5&pageSize=10",
+        &token,
+    )
+    .await;
+    let page: Value = serde_json::from_str(&page.body).unwrap();
+    assert_eq!(page["current"], 1);
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["list"].as_array().unwrap().len(), 2);
+
+    // Java's manual validStatus path could throw `subList` here. This service
+    // intentionally returns an empty page instead.
+    let page = get_auth(
+        &router,
+        "/api/sonarr/example/query?current=2&pageSize=10&validStatus=0",
+        &token,
+    )
+    .await;
+    assert_eq!(page.status, 200);
+    let page: Value = serde_json::from_str(&page.body).unwrap();
+    assert_eq!(page["current"], 2);
+    assert_eq!(page["total"], 0);
+    assert!(page["list"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn config_update_inserts_a_row_whose_id_does_not_exist() {
+    let env = TestEnv::start().await;
+    let router = env.router_with(auth_config(&env, false)).await;
+    let token = login(&router, "Anonymous", "Anonymous").await.body;
+
+    let rows = json!([{
+        "id": 99999,
+        "key": "futureKey",
+        "value": "synthetic",
+        "validStatus": 1
+    }]);
+    let update = post_json_auth(
+        &router,
+        "/api/system/config/update",
+        &token,
+        &rows.to_string(),
+    )
+    .await;
+    assert_eq!(update.status, 200);
+
+    let pool = env.pool().await;
+    let value: String = sqlx::query_scalar(
+        "SELECT value FROM system_config WHERE id = 99999 AND \"key\" = 'futureKey'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(value, "synthetic");
 }
 
 #[tokio::test]

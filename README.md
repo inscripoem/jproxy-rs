@@ -32,11 +32,20 @@ Implemented:
 - Rule sync using the Java GitHub author-directory protocol: `author.json`,
   `sonarr@{author}.json`, and `radarr@{author}.json`, with backup-location
   fallback and per-author error isolation.
-- Baseline `system_config` keys (`sonarrUrl`, `sonarrApikey`, `radarrUrl`,
-  `radarrApikey`, `tmdbUrl`, `tmdbApikey`, `sonarrLanguage1`,
-  `sonarrLanguage2`, `ruleSyncAuthors`) with environment override, plus the
-  downloader keys described below. Downloader credentials are read only to log
-  in and are never logged.
+- Baseline `system_config` keys (`sonarrUrl`, `sonarrApikey`,
+  `sonarrIndexerFormat`, `sonarrLanguage1`, `sonarrLanguage2`, `radarrUrl`,
+  `radarrApikey`, `radarrIndexerFormat`, `jackettUrl`, `prowlarrUrl`, `tmdbUrl`,
+  `tmdbApikey`, `cleanTitleRegex`, `ruleSyncAuthors`) with environment
+  override, plus the downloader keys described below. Downloader credentials
+  are read only to log in and are never logged.
+- Live config validation on `/api/system/config/update` (Sonarr/Radarr health,
+  TMDB, qBittorrent/Transmission login, Jackett/Prowlarr reachability, format
+  tokens, and regex compilation) with Java-compatible `validStatus` codes.
+- Shared refreshable configuration: updates and `system_config` cache clears
+  apply immediately without a restart. Invalid rows fail strict
+  `queryValueByKey` reads while proxy traffic degrades instead of panicking.
+- Exact Java cron schedules in process-local time, plus the GitHub release
+  version check.
 - qBittorrent and Transmission login with scheduled session refresh. Both
   failures and successes are logged without credentials or session values.
 - Sonarr/Radarr history rename tasks, including `RENAME_FILE` file renaming for
@@ -97,7 +106,7 @@ The test suite includes:
 - `tests/real_data.rs` — validation against data exported from a live jproxy.
 
 The release profile sets `opt-level = "z"`, thin LTO, one codegen unit and
-`strip = true`; the resulting binary is about 8.8 MB. Panic unwinding is left
+`strip = true`; the resulting binary is about 9.0 MB. Panic unwinding is left
 enabled so a handler panic cannot abort the whole process. See
 [Resource use](#resource-use) for measured RSS.
 
@@ -205,17 +214,25 @@ for each query, and exits non-zero when any query differs. Without
 
 Precedence is **environment > `system_config` > built-in default** for the
 keys listed below. Only the following `system_config` keys are read:
-`sonarrUrl`, `sonarrApikey`, `radarrUrl`, `radarrApikey`, `tmdbUrl`,
-`tmdbApikey`, `sonarrLanguage1`, `sonarrLanguage2`, `ruleSyncAuthors`,
-`ruleLocation`, `ruleLocationBackup`, `qbittorrentUrl`, `qbittorrentUsername`,
-`qbittorrentPassword`, `transmissionUrl`, `transmissionUsername`,
-`transmissionPassword`. Downloader credentials are held in memory, used only
-for login, and are never logged or included in the startup summary. The admin
-login reads `system_user` only to verify a submitted password; it never logs or
-returns stored hashes. Values are resolved once at startup; restart the process
-after changing `system_config` or the environment. The admin `config/update`
-endpoint persists rows immediately (so the UI reflects them) but runtime
-behaviour still uses the startup values until restart.
+`sonarrUrl`, `sonarrApikey`, `sonarrIndexerFormat`, `sonarrLanguage1`,
+`sonarrLanguage2`, `radarrUrl`, `radarrApikey`, `radarrIndexerFormat`,
+`jackettUrl`, `prowlarrUrl`, `tmdbUrl`, `tmdbApikey`, `cleanTitleRegex`,
+`ruleSyncAuthors`, `ruleLocation`, `ruleLocationBackup`,
+`qbittorrentUrl`, `qbittorrentUsername`, `qbittorrentPassword`,
+`transmissionUrl`, `transmissionUsername`, `transmissionPassword`. Downloader
+credentials are held in memory, used only for login, and are never logged or
+included in the startup summary. The admin login reads `system_user` only to
+verify a submitted password; it never logs or returns stored hashes.
+
+Configuration is resolved into a shared snapshot at startup and re-resolved
+after every successful `/api/system/config/update` or
+`/api/system/cache/clear` with `cacheName=system_config`. New URLs, API keys,
+languages, rule locations, indexer formats, clean-title regex, and downloader
+credentials therefore apply without a restart. Environment values remain
+overrides. A read of a row whose `validStatus` is `INVALID` fails with a
+Java-compatible `SystemConfigException` equivalent; background tasks skip or
+log that failure instead of using the value. A `system_config` row is never
+used for a key that the environment supplied, even when the values are equal.
 
 All other settings remain environment-only.
 
@@ -252,15 +269,13 @@ All other settings remain environment-only.
 | `TRANSMISSION_URL` | `system_config.transmissionUrl` | Full Transmission JSON-RPC URL, normally `http://host:9091/transmission/rpc`. |
 | `TRANSMISSION_USERNAME` | `system_config.transmissionUsername` | Transmission username. Never logged. |
 | `TRANSMISSION_PASSWORD` | `system_config.transmissionPassword` | Transmission password (blank allowed). Never logged. |
-| `DOWNLOADER_LOGIN_INTERVAL_SECS` | `1800` | Seconds between scheduled re-logins (Java runs every 30 minutes). `0` keeps the startup login only. |
-| `SONARR_RENAME_INTERVAL_SECS` | `30` | Seconds between Sonarr rename passes (Java cron `0/30 * * * * ?`). `0` disables the task. |
-| `RADARR_RENAME_INTERVAL_SECS` | `60` | Seconds between Radarr rename passes (Java cron `0 0/1 * * * ?`). `0` disables the task. |
 | `SONARR_RENAME_FALLBACK_MINS` | `30` | Sonarr history lookback window in minutes. |
 | `RADARR_RENAME_FALLBACK_MINS` | `30` | Radarr history lookback window in minutes. |
 | `RENAME_FILE` | `true` | Also rename files inside a qBittorrent torrent after the torrent rename succeeds. Transmission has no file-level rename. |
 | `LOGIN_ENABLED` | `false` | Require credentials for `/api/**` admin routes. When false, `/api/system/user/login` returns an Anonymous JWT; the UI still needs that token for admin calls. |
 | `TOKEN_EXPIRES` | `10080` | Admin JWT lifetime in minutes (seven days). |
 | `ADMIN_UI_DIR` | `admin_dist` | Directory containing the compiled admin UI (`index.html` and `assets/`). Missing files return 404; it is never fetched at runtime. |
+| `VERSION_CHECK_URL` | Java GitHub `releases/latest` endpoint | Release endpoint used by `/api/system/config/version`; override points tests at a local mock. |
 | `REQUEST_TIMEOUT_SECS` | `30` | Upstream and sync HTTP timeout. |
 | `RESULT_CACHE_MAX_ENTRIES` | `1000` | Maximum cached Torznab responses. |
 | `UPSTREAM_MAX_CONCURRENCY` | `8` | Maximum simultaneous upstream indexer requests. |
@@ -313,28 +328,56 @@ Authentication follows the Java controller and interceptor:
   (minutes) controls expiry. Tokens become invalid after a process restart.
   Logout blacklists the raw `Authorization` header. More than ten wrong logins
   block login until restart, as in Java.
-- `/api/system/config/update` normalizes the Transmission URL, sets
-  `validStatus` for the known keys, and persists the rows. Validation is
-  syntactic and does not contact Sonarr/Radarr/TMDB/downloaders. Configuration
-  is applied to runtime behaviour at the next restart; the database and UI
-  reflect the update immediately. Values are never logged.
-- `/api/system/config/version` reports this service's version without the Java
-  GitHub release check.
+- `/api/system/config/update` reproduces Java's live validation:
+  - Sonarr/Radarr: `GET {url}/api/v3/health?apikey=...` with 6 s connect and
+    12 s read timeouts. A 401 or an `Unauthorized` body marks only the URL
+    valid; a connection failure marks both invalid.
+  - Indexer formats: Sonarr requires `{title}`, `{season}`, `{episode}`;
+    Radarr requires `{title}`, `{year}`.
+  - qBittorrent and Transmission: check the URL, normalize the Transmission
+    JSON-RPC path, then log in with the submitted credentials. URL, username,
+    and password each receive their own `validStatus`.
+  - Jackett and Prowlarr: any HTTP response counts as reachable; a connection
+    failure does not.
+  - TMDB: `GET {url}/3/movie/550?api_key=...`; an invalid key or 401 marks only
+    the URL valid.
+  - `cleanTitleRegex` is compiled before it is stored.
+  The rows are persisted with Java's upsert semantics, then the shared
+  configuration snapshot and dependent caches are refreshed immediately.
+  URLs, API keys, usernames, passwords, and tokens are never logged.
+- `/api/system/config/version` queries the Java GitHub `releases/latest`
+  endpoint with a bounded timeout, strips `v` from `tag_name`, compares it with
+  this package's version, and appends ` 🚨` on a mismatch. Any failure returns
+  the local version. Tests point `VERSION_CHECK_URL` at a local mock.
+- `/api/system/config/query` runs one Sonarr rename pass before returning the
+  rows, matching the Java controller.
+- Example pagination follows MyBatis-Plus `overflow: true` for unfiltered
+  queries. The Java `validStatus` path can throw `subList` when the requested
+  page is past the filtered end; this service returns an empty page instead
+  (documented deviation).
 
 ## Background schedule
 
-Titles synchronize hourly and rules daily, approximating the Java cron schedule
-from process start rather than at Java's fixed minutes. The first tick runs
-immediately. The `SYNC_INTERVAL` gate limits title synchronization (background
-and on-demand) to one attempt per interval; it does not make rules refresh every
-three minutes. `SYNC_INTERVAL` defaults to 3, matching Java's Caffeine gate.
+Schedules use the exact Java cron expressions in process-local time. A cron
+entry does not fire at process start, so the first run is the next matching
+wall-clock boundary.
 
-Downloader login runs once at startup, like Java's `CommandLineRunner`, then
-every `DOWNLOADER_LOGIN_INTERVAL_SECS` (30 minutes by default). Sonarr rename
-runs every 30 seconds and Radarr rename every minute, matching the Java cron
-entries; like a cron entry, neither rename task fires at process start. All
-three schedules start counting from process start rather than at fixed wall
-clock seconds.
+| Task | Java cron | Fire times |
+| --- | --- | --- |
+| Sonarr title sync + TMDB sync | `0 0 0/1 * * ?` | Hourly at `:00`. |
+| Radarr title sync | `0 30 0/1 * * ?` | Hourly at `:30`. |
+| Sonarr rule sync | `0 15 0 * * ?` | Daily at `00:15`. |
+| Radarr rule sync | `0 45 1 * * ?` | Daily at `01:45`. |
+| Sonarr rename | `0/30 * * * * ?` | Seconds `0` and `30` of every minute. |
+| Radarr rename | `0 0/1 * * * ?` | Second `0` of every minute. |
+| Downloader login | `0 */30 * * * ?` | Startup, then `:00` and `:30` of every hour. |
+
+The downloader login is the only task with a startup run, matching Java's
+`CommandLineRunner`. The `SYNC_INTERVAL` gate still limits Sonarr/Radarr title
+synchronization (background and on-demand) to one attempt per interval; it does
+not gate rule synchronization. `SYNC_INTERVAL` defaults to 3, matching Java's
+Caffeine gate. Clock jumps skip to the next matching boundary rather than
+replaying missed runs.
 
 ### Downloader login
 
@@ -532,6 +575,20 @@ The measured log contained none of the synthetic password, cookie, or API key
 values. The feature profile remains below both the 30–45 MB baseline target and
 the 100 MB full-parity target.
 
+Strict-parity profile, measured with the release binary, a temporary SQLite
+database, one local Python mock for probes and Torznab responses,
+`SYNC_ENABLED=false`, `MIN_COUNT=0`, and synthetic credentials. RSS is `VmRSS`,
+five samples per phase and the median of three independent runs.
+
+| Phase | Workload | RSS |
+| --- | --- | --- |
+| Idle | No requests | 10.5 MB (10,672–10,756 KB) |
+| After config probes with mocks | Sonarr/Radarr/TMDB health, qBittorrent/Transmission login, Jackett/Prowlarr checks | 11.6 MB (11,428–11,832 KB) |
+| Under proxy load | 2,000 Torznab queries, concurrency 16, 2,000 distinct `q` values | 16.6 MB (16,652–17,224 KB) |
+
+The application logs contained none of the synthetic keys, passwords, cookies,
+or session ids. No real credential, live service, or NAS path was used.
+
 ### Admin UI/API profile
 
 Method: release binary, temporary SQLite database, `admin_dist/` served from
@@ -614,9 +671,10 @@ mechanism rather than committing them.
 - **Rule tie-break.** Java orders rules by `priority ASC` only. This
   implementation adds a stable `id ASC` tie-break so equal priorities are
   deterministic; the bundled rule set has unique priorities.
-- **Sync schedule.** Titles run hourly and rules daily from process start. Java
-  uses cron at `:00`/`:30` and `00:15`/`01:45` local time. The three-minute
-  `SYNC_INTERVAL` gate and the Java-compatible upserts are preserved.
+- **Sync schedule.** Titles and rules use Java's exact cron expressions in
+  process-local time: `:00` Sonarr titles, `:30` Radarr titles, `00:15` Sonarr
+  rules, and `01:45` Radarr rules. The three-minute `SYNC_INTERVAL` gate and
+  the Java-compatible upserts are preserved.
 - **On-demand sync.** Java's synchronized path can propagate an HTTP failure.
   This implementation bounds the attempt with `ONDEMAND_SYNC_TIMEOUT_SECS`,
   serializes concurrent misses per kind, logs failures, and continues with the
@@ -629,13 +687,12 @@ mechanism rather than committing them.
   author list cannot alter the rule URL path. Java checks the primary location
   once at startup and switches the global rule location to the backup; this
   implementation retries the backup for each fetch.
-- **Rename schedule.** Sonarr (30 s) and Radarr (60 s) intervals match the Java
-  cron expressions, but the ticker counts from process start instead of the
-  wall-clock second. The history fallback windows are 30 minutes for both, as
-  in `application-prod.yml`. `DOWNLOADER_LOGIN_INTERVAL_SECS`,
-  `SONARR_RENAME_INTERVAL_SECS`, `RADARR_RENAME_INTERVAL_SECS`, and the two
-  fallback variables are environment extensions because Java stores these
-  timings in `application-prod.yml`.
+- **Rename schedule.** Sonarr (`0/30 * * * * ?`) and Radarr
+  (`0 0/1 * * * ?`) use the exact Java cron expressions in process-local time;
+  neither fires at process start. The history fallback windows are 30 minutes
+  for both, as in `application-prod.yml`; `SONARR_RENAME_FALLBACK_MINS` and
+  `RADARR_RENAME_FALLBACK_MINS` are environment extensions because Java stores
+  these timings in `application-prod.yml`.
 - **Downloader configuration.** qBittorrent is configured as a base URL; the
   client appends `/api/v2/...`. Transmission is configured with the full
   JSON-RPC URL, as in Java. Credentials now come from the same whitelist as
@@ -682,17 +739,25 @@ mechanism rather than committing them.
   tokens die on restart; this implementation does the same. The logout
   blacklist is process-local and is cleared by `cache/clearAll`, matching
   Java's cache clear-all.
-- **Config validation is syntactic.** Java probes Sonarr/Radarr/TMDB and both
-  downloaders with live HTTP requests when `/api/system/config/update` runs.
-  This implementation validates URL shape, required format tokens, and regex
-  compilation without outbound calls, and marks downloader credentials valid
-  only when the URL and both credential fields are present. The UI status icons
-  can therefore differ from Java until a live login succeeds.
-- **Config updates need a restart.** `/api/system/config/update` writes the
-  database and clears caches/gates, but the proxy and sync tasks keep the
-  startup `Config` values. Java reloads them through its `system_config` cache.
-- **Admin version check.** `/api/system/config/version` reports the Rust
-  package version without calling GitHub.
+- **Config validation uses live probes.** `/api/system/config/update` checks
+  Sonarr/Radarr health, TMDB, qBittorrent and Transmission login, and
+  Jackett/Prowlarr reachability with the same status codes and timeouts as
+  Java's `CheckUtil`, then compiles the clean-title regex and checks format
+  tokens locally. Probe traffic uses only the submitted URLs; failure messages
+  never include the URL, key, username, password, cookie, or session id.
+- **Config hot reload.** Successful updates and `cache/clear` for
+  `system_config` replace a shared snapshot, so proxy formatting and sync tasks
+  use new values without restart. Java achieves the same through its
+  `SYSTEM_CONFIG` cache. Rows marked `INVALID` fail strict reads; callers skip
+  or degrade rather than panicking.
+- **Admin version check.** `/api/system/config/version` calls the same GitHub
+  `releases/latest` endpoint as Java, with a bounded timeout. It compares the
+  tag with this package's `0.1.0`, so the ` 🚨` marker normally appears when a
+  Java release exists. `VERSION_CHECK_URL` exists so tests use a local mock.
+- **Example pagination edge.** Unfiltered example queries use MyBatis-Plus
+  `overflow: true` semantics. Java's filtered `validStatus` path can throw
+  `IndexOutOfBoundsException` from `subList` for a page past the filtered end;
+  this service returns an empty page instead.
 - **Admin UI delivery.** The compiled UI is vendored from the Java distribution
   (MIT, see `admin_dist/LICENSE.txt`) and served from disk; it is not rebuilt or
   downloaded at runtime. Unknown `/api/**` paths require authentication and
@@ -716,6 +781,8 @@ src/cache.rs        bounded TTL cache
 src/db.rs           sqlx SQLite queries and schema setup
 src/downloader.rs   qBittorrent/Transmission login, sessions and API calls
 src/import.rs       reference-table import path (`jproxy-rs import`)
+src/probe.rs        Java CheckUtil live config probes
+src/schedule.rs     exact Java cron next-run calculation and wall-clock loops
 src/rename.rs       Sonarr/Radarr history rename tasks and schedules
 src/sync.rs         Sonarr/Radarr title sync, TMDB sync, rule sync, on-demand
 src/upstream.rs     reqwest/rustls upstream client, retry and concurrency

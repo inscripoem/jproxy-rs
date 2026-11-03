@@ -23,11 +23,12 @@ async fn main() -> Result<()> {
     info!("starting jproxy-rs {}", env!("CARGO_PKG_VERSION"));
 
     let state = AppState::new(config).await?;
-    info!("{}", state.config.startup_summary());
+    let snapshot = state.snapshot();
+    info!("{}", snapshot.startup_summary());
     sync::spawn(state.clone());
     rename::spawn(state.clone());
 
-    let listen_addr = state.config.listen_addr;
+    let listen_addr = snapshot.listen_addr;
     let listener = TcpListener::bind(listen_addr).await?;
     info!(%listen_addr, "listening");
     axum::serve(listener, app::router(state))

@@ -760,9 +760,9 @@ pub async fn query_examples_page(
     pool: &SqlitePool,
     kind: AppKind,
     original_text: &Option<String>,
-    offset: i64,
+    mut offset: i64,
     limit: i64,
-) -> Result<(i64, Vec<ExampleRecord>)> {
+) -> Result<(i64, i64, Vec<ExampleRecord>)> {
     let table = table(kind, "example");
     let original = like(original_text);
     let where_sql = if original.is_some() {
@@ -778,6 +778,12 @@ pub async fn query_examples_page(
     }
     let total: i64 = count_query.fetch_one(pool).await?.try_get("count")?;
 
+    // MyBatis-Plus runs with `overflow: true`: a page past the end restarts at
+    // page one, including its offset.
+    if total > 0 && offset >= total {
+        offset = 0;
+    }
+
     let list_sql = format!(
         "SELECT hash, original_text, format_text, valid_status, create_time, update_time \
          FROM {table}{where_sql} ORDER BY update_time DESC LIMIT ? OFFSET ?"
@@ -791,7 +797,7 @@ pub async fn query_examples_page(
         .iter()
         .map(example_from_row)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((total, list))
+    Ok((total, offset, list))
 }
 
 pub async fn query_examples_all(
@@ -1004,21 +1010,33 @@ pub async fn query_system_config(pool: &SqlitePool) -> Result<Vec<SystemConfigRe
         .collect()
 }
 
-pub async fn config_value(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
-    Ok(sqlx::query_scalar::<_, Option<String>>(
-        "SELECT value FROM system_config WHERE \"key\" = ? AND valid_status = 1 \
-         ORDER BY id LIMIT 1",
-    )
-    .bind(key)
-    .fetch_optional(pool)
-    .await?
-    .flatten())
-}
-
 pub async fn update_system_config(pool: &SqlitePool, configs: &[SystemConfigRecord]) -> Result<()> {
     let mut transaction = pool.begin().await?;
     for config in configs {
         if let Some(id) = config.id {
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM system_config WHERE id = ?")
+                .bind(id)
+                .fetch_one(&mut *transaction)
+                .await?;
+            if exists == 0 {
+                // MyBatis-Plus `saveOrUpdateBatch` inserts when `selectById`
+                // finds no row, even when the entity already carries an id.
+                let key = config
+                    .key
+                    .as_deref()
+                    .context("system config key is required")?;
+                sqlx::query(
+                    "INSERT INTO system_config (id, \"key\", value, valid_status) \
+                     VALUES (?, ?, ?, COALESCE(?, 1))",
+                )
+                .bind(id)
+                .bind(key)
+                .bind(&config.value)
+                .bind(config.valid_status)
+                .execute(&mut *transaction)
+                .await?;
+                continue;
+            }
             sqlx::query(
                 "UPDATE system_config SET \"key\" = COALESCE(?, \"key\"), \
                  value = COALESCE(?, value), valid_status = COALESCE(?, valid_status), \

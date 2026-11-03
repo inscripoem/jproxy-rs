@@ -542,13 +542,14 @@ impl TestEnv {
             cache_expires: Duration::from_secs(60),
             sync_interval: Duration::ZERO,
             indexer_result_cache_expires: Duration::from_secs(15),
-            downloader_login_interval: Duration::from_secs(1800),
-            sonarr_rename_interval: Duration::from_secs(30),
-            radarr_rename_interval: Duration::from_secs(60),
             sonarr_rename_fallback: Duration::from_secs(1800),
             radarr_rename_fallback: Duration::from_secs(1800),
             rename_file: false,
             token_expires: Duration::from_secs(10080 * 60),
+            version_check_url: format!(
+                "{}/repos/LuckyPuppy514/jproxy/releases/latest",
+                self.mock.base_url()
+            ),
             admin_ui_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("admin_dist"),
             login_enabled: false,
             sync_enabled: false,

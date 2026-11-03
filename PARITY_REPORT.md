@@ -317,3 +317,113 @@ logged, or committed. All measurements used temporary files outside the NAS.
 2. Schedule the Charon downloader proxy routes as a separate follow-up?
 3. Accept syntactic config validation and restart-to-apply as the shipped
    behaviour, or require live probes/hot reload in a later phase?
+
+## Strict Java-source alignment phase (2026-11-03)
+
+Commit on `features/full-parity`: `jproxy-rs: strict java parity fixes`
+(not pushed). This phase resolves the earlier deviations for live config
+validation, hot reload, exact cron timing, the version endpoint, and
+example pagination.
+
+### Implemented
+
+- `/api/system/config/update` now reproduces Java
+  `SystemConfigServiceImpl.updateSystemConfig` and `CheckUtil`:
+  - Sonarr/Radarr `GET {url}/api/v3/health?apikey=...` with 6 s connect and
+    12 s read timeouts. A 401, or a 2xx body containing `Unauthorized`, marks
+    only the URL valid; other non-2xx responses (except the Java-rest-template
+    special case 409) mark both invalid.
+  - Sonarr format must contain `{title}`, `{season}`, `{episode}`; Radarr
+    format must contain `{title}`, `{year}`.
+  - qBittorrent: URL check followed by a real login with the submitted
+    credentials; URL, username and password each get a `validStatus`.
+  - Transmission: one trailing slash is removed, `/transmission/web` is
+    stripped, `/transmission/rpc` is appended, then the same URL-check and
+    login sequence runs.
+  - Jackett/Prowlarr: any HTTP response proves reachability; transport
+    failures do not.
+  - TMDB `GET {url}/3/movie/550?api_key=...`: an `Invalid API key` body or 401
+    marks only the URL valid.
+  - `cleanTitleRegex` is compiled before persisting.
+  - Rows are persisted with the existing Java-compatible upsert semantics.
+- Configuration is now a shared, atomically replaced snapshot
+  (`ConfigStore`), the equivalent of `@Cacheable(SYSTEM_CONFIG)` plus the
+  update-time eviction. Successful updates and
+  `cache/clear` with `cacheName=system_config` re-read the database. New
+  Sonarr/Radarr/TMDB URLs, API keys, languages, rule locations, indexer
+  formats, clean-title regex, Prowlarr/Jackett URLs, and downloader
+  credentials apply without restart.
+- Environment values still take precedence, including when the environment
+  value happens to equal the built-in default. Rows with
+  `validStatus = INVALID` are never applied.
+- `queryValueByKey`-equivalent reads return
+  `ConfigLookupError::Invalid(key)` for invalid rows. Callers degrade
+  deliberately: title/rule/directory/downloader tasks skip with a debug log;
+  indexer formatting returns the upstream XML unchanged; admin previews
+  return HTTP 500 like Java's `SystemConfigException` handler. No path panics.
+- Exact cron scheduling in process-local time:
+  - Sonarr titles `0 0 0/1 * * ?` (hourly at `:00`) followed by the TMDB pass.
+  - Radarr titles `0 30 0/1 * * ?` (hourly at `:30`).
+  - Sonarr rules `0 15 0 * * ?` (daily `00:15`).
+  - Radarr rules `0 45 1 * * ?` (daily `01:45`).
+  - Sonarr rename `0/30 * * * * ?` (seconds `0`/`30`).
+  - Radarr rename `0 0/1 * * * ?` (second `0` each minute).
+  - Downloader login `0 */30 * * * ?` (startup plus `:00`/`:30`).
+  Cron tasks do not run at process start; only downloader login has the Java
+  `CommandLineRunner` startup run. The 3-minute `SYNC_INTERVAL` gate remains
+  for title sync only. Next-run calculation is unit-tested without sleeps.
+- `/api/system/config/version` queries the Java GitHub `releases/latest`
+  endpoint with a bounded 5 s timeout, parses `tag_name`, strips `v`, compares
+  with the local package version, and appends ` 🚨` on a mismatch. Any failure
+  returns the local version. `VERSION_CHECK_URL` lets tests use a local mock.
+- `/api/system/config/query` keeps Java's behaviour: one Sonarr rename pass
+  runs synchronously before the config rows are returned.
+- Example pagination: unfiltered queries now follow MyBatis-Plus
+  `overflow: true` and restart an out-of-range page at one (including its SQL
+  offset). The Java `validStatus` manual-pagination block can throw
+  `IndexOutOfBoundsException` from `subList` when the requested page is past
+  the filtered end; this service intentionally returns an empty page instead
+  and documents the deviation.
+
+### Verification
+
+- `cargo fmt --check`: pass.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo test`: **149 passed, 0 failed** — 83 unit, 21 admin, 5 downloader,
+  10 parity, 3 real-data, 7 rename, 14 sync, 6 upstream-error. The new tests
+  cover probe codes, invalid-status reads, config-update hot reload, Java
+  upsert with an unknown id, cron next-run calculations, the version endpoint,
+  query-triggered rename, and the pagination edge.
+- `cargo build --release`: pass; binary 9.0 MB.
+
+### Resource measurements
+
+Method: release binary, temporary SQLite database, one local Python mock for
+all probes and Torznab responses, `SYNC_ENABLED=false`, `MIN_COUNT=0`,
+`LOGIN_ENABLED=false`, synthetic credentials only. `VmRSS` read from
+`/proc/<pid>/status`, five samples per phase, three independent runs; the value
+below is the median with the observed range.
+
+| Phase | Workload | RSS |
+| --- | --- | --- |
+| Idle | No requests | 10.5 MB (10,672–10,756 KB) |
+| After config probes with mocks | Sonarr/Radarr/TMDB health, qBittorrent and Transmission login, Jackett/Prowlarr checks | 11.6 MB (11,428–11,832 KB) |
+| Under proxy load | 2,000 Torznab queries, concurrency 16, 2,000 distinct `q` values | 16.6 MB (16,652–17,224 KB) |
+
+The application logs contained none of the synthetic API keys, usernames,
+passwords, cookies, or session ids. No real credential, live service, NAS path,
+or `/mnt/user` write was used.
+
+### Remaining deviations
+
+- The GitHub version comparison uses this package's `0.1.0` as the local
+  version, so a live Java release tag normally produces the ` 🚨` marker.
+  Java compares its own Maven project version.
+- The Java `validStatus` example pagination path returns an empty page instead
+  of throwing `subList` (deliberate safety deviation).
+- Java's Caffeine cache internals and the Charon downloader proxy routes remain
+  out of scope; the Charon routes are inactive in the current Java build.
+- Probe/login timeouts for the shared downloader clients are bounded by
+  `REQUEST_TIMEOUT_SECS` (30 s) rather than Java's 15-minute RestTemplate.
+- No live A/B was performed against a real Sonarr/Radarr/TMDB/downloader or the
+  NAS service; all probes and loads used local mocks.

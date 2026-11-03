@@ -750,10 +750,17 @@ async fn example_query(
         )
         .await
         {
-            Ok((total, rows)) => {
+            Ok((total, used_offset, rows)) => {
                 let rows = match format_examples(state, kind, headers, rows).await {
                     Ok(rows) => rows,
                     Err(error) => return internal_error("format examples", error),
+                };
+                // MyBatis-Plus runs with `overflow: true`, so a page past the
+                // end restarts at page one.
+                let current = if total > 0 && used_offset != offset {
+                    1
+                } else {
+                    current
                 };
                 return Json(Page {
                     current,
@@ -808,21 +815,16 @@ async fn format_examples(
         AppKind::Sonarr => "sonarrIndexerFormat",
         AppKind::Radarr => "radarrIndexerFormat",
     };
-    let format = admin_db::config_value(&state.pool, format_key)
-        .await?
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| match kind {
-            AppKind::Sonarr => state.config.sonarr_indexer_format.clone(),
-            AppKind::Radarr => state.config.radarr_indexer_format.clone(),
-        });
-    let clean_source = admin_db::config_value(&state.pool, "cleanTitleRegex")
-        .await?
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| state.config.clean_title_regex.clone());
-    let clean_regex = Regex::new(&clean_source).unwrap_or_else(|_| {
-        Regex::new(crate::config::DEFAULT_CLEAN_TITLE_REGEX)
-            .expect("default clean title regex is valid")
-    });
+    let snapshot = state.snapshot();
+    let format = snapshot
+        .query_value_by_key(format_key)
+        .map(str::to_owned)
+        .map_err(anyhow::Error::from)?;
+    let clean_source = snapshot
+        .query_value_by_key("cleanTitleRegex")
+        .map(str::to_owned)
+        .map_err(anyhow::Error::from)?;
+    let clean_regex = Regex::new(&clean_source).map_err(anyhow::Error::from)?;
     let data = FormattingData::load_example(&state.pool, kind, &format, clean_regex).await?;
     let fail_text = message("example.match.title.fail", headers);
 
@@ -933,16 +935,15 @@ async fn tmdb_title_query(
         Ok(page) => page,
         Err(error) => return internal_error("query TMDB titles", error),
     };
-    let clean_source = admin_db::config_value(&state.pool, "cleanTitleRegex")
-        .await
-        .ok()
-        .flatten()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| state.config.clean_title_regex.clone());
-    let clean_regex = Regex::new(&clean_source).unwrap_or_else(|_| {
-        Regex::new(crate::config::DEFAULT_CLEAN_TITLE_REGEX)
-            .expect("default clean title regex is valid")
-    });
+    let snapshot = state.snapshot();
+    let clean_source = match snapshot.query_value_by_key("cleanTitleRegex") {
+        Ok(value) => value.to_owned(),
+        Err(error) => return internal_error("clean title regex", anyhow::Error::from(error)),
+    };
+    let clean_regex = match Regex::new(&clean_source) {
+        Ok(regex) => regex,
+        Err(error) => return internal_error("compile clean title regex", error.into()),
+    };
     let list = page
         .list
         .into_iter()
@@ -996,10 +997,57 @@ async fn tmdb_title_save(
 // System config and cache
 // ---------------------------------------------------------------------------
 
-async fn system_config_version() -> Response {
-    // Java also queries GitHub for a newer release. This service reports its
-    // own version without an outbound network call.
-    text(StatusCode::OK, env!("CARGO_PKG_VERSION"))
+async fn system_config_version(State(state): State<AppState>) -> Response {
+    let local = env!("CARGO_PKG_VERSION");
+    let url = state.snapshot().version_check_url.clone();
+    match latest_release_version(&state, &url).await {
+        Some(latest) if latest != local => text(StatusCode::OK, format!("{local} 🚨")),
+        _ => text(StatusCode::OK, local),
+    }
+}
+
+/// Java `SystemConfigController.version`: read `tag_name`, strip `v`, compare
+/// with the local version. Any failure returns the local version.
+async fn latest_release_version(state: &AppState, url: &str) -> Option<String> {
+    let timeout = state.snapshot().request_timeout.min(Duration::from_secs(5));
+    let request = state
+        .upstream
+        .http_client()
+        .get(url)
+        .header("accept", "application/vnd.github+json")
+        .send();
+    match tokio::time::timeout(timeout, request).await {
+        Ok(Ok(response)) if response.status().is_success() => {
+            match response.json::<Value>().await {
+                Ok(payload) => payload
+                    .get("tag_name")
+                    .and_then(Value::as_str)
+                    .map(|tag| tag.replace('v', "")),
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error.without_url(),
+                        "parse latest release response failed"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(Ok(response)) => {
+            tracing::debug!(status = %response.status(), "latest release query failed");
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(
+                error = %error.without_url(),
+                "latest release query failed"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::debug!("latest release query timed out");
+            None
+        }
+    }
 }
 
 async fn system_config_query(State(state): State<AppState>) -> Response {
@@ -1013,43 +1061,25 @@ async fn system_config_query(State(state): State<AppState>) -> Response {
     }
 }
 
-fn blank(value: Option<&str>) -> bool {
-    value.is_none_or(|value| value.trim().is_empty())
-}
-
-fn check_url(value: Option<&str>) -> bool {
-    value.is_some_and(|value| !value.trim().is_empty() && value.starts_with("http"))
-}
-
-/// Syntactic version of Java `CheckUtil.checkSonarrOrRadarrApi`. The upstream
-/// implementation also probes `/api/v3/health`; this service avoids outbound
-/// calls during config saves (documented deviation).
-fn check_api(url: Option<&str>, api_key: Option<&str>) -> i64 {
-    if blank(url) && blank(api_key) {
-        return 0;
-    }
-    if !check_url(url) {
-        return 0;
-    }
-    if blank(api_key) { 1 } else { 2 }
-}
-
 fn valid_code(flag: bool) -> i64 {
     if flag { 1 } else { 0 }
 }
 
+/// Java normalizes a non-blank Transmission URL by removing one trailing
+/// slash, stripping `/transmission/web`, and appending `/transmission/rpc`.
 fn normalize_transmission_url(value: &str) -> String {
     if value.trim().is_empty() {
         return value.to_owned();
     }
-    let mut url = value.trim_end_matches('/').to_owned();
+    let mut url = value.strip_suffix('/').unwrap_or(value).to_owned();
     if !url.ends_with("/transmission/rpc") {
         url = url.replace("/transmission/web", "") + "/transmission/rpc";
     }
     url
 }
 
-fn apply_config_validation(configs: &mut [SystemConfigRecord]) {
+/// Java `SystemConfigServiceImpl.updateSystemConfig`.
+async fn apply_live_validation(configs: &mut [SystemConfigRecord], state: &AppState) {
     let positions: HashMap<String, usize> = configs
         .iter()
         .enumerate()
@@ -1066,51 +1096,57 @@ fn apply_config_validation(configs: &mut [SystemConfigRecord]) {
         }
     };
 
-    let sonarr_url = value(configs, "sonarrUrl");
-    let sonarr_key = value(configs, "sonarrApikey");
-    let sonarr = check_api(sonarr_url.as_deref(), sonarr_key.as_deref());
-    set(configs, "sonarrUrl", valid_code(sonarr >= 1));
-    set(configs, "sonarrApikey", valid_code(sonarr == 2));
+    let sonarr = state
+        .prober
+        .check_sonarr_or_radarr(
+            value(configs, "sonarrUrl").as_deref(),
+            value(configs, "sonarrApikey").as_deref(),
+        )
+        .await;
+    set(configs, "sonarrUrl", valid_code(sonarr.url_valid()));
+    set(configs, "sonarrApikey", valid_code(sonarr.api_key_valid()));
 
     if let Some(format) = value(configs, "sonarrIndexerFormat") {
         set(
             configs,
             "sonarrIndexerFormat",
-            valid_code(
-                !format.trim().is_empty()
-                    && format.contains("{title}")
-                    && format.contains("{season}")
-                    && format.contains("{episode}"),
-            ),
+            valid_code(crate::probe::check_sonarr_indexer_format(Some(&format))),
         );
     }
 
-    let radarr_url = value(configs, "radarrUrl");
-    let radarr_key = value(configs, "radarrApikey");
-    let radarr = check_api(radarr_url.as_deref(), radarr_key.as_deref());
-    set(configs, "radarrUrl", valid_code(radarr >= 1));
-    set(configs, "radarrApikey", valid_code(radarr == 2));
+    let radarr = state
+        .prober
+        .check_sonarr_or_radarr(
+            value(configs, "radarrUrl").as_deref(),
+            value(configs, "radarrApikey").as_deref(),
+        )
+        .await;
+    set(configs, "radarrUrl", valid_code(radarr.url_valid()));
+    set(configs, "radarrApikey", valid_code(radarr.api_key_valid()));
 
     if let Some(format) = value(configs, "radarrIndexerFormat") {
         set(
             configs,
             "radarrIndexerFormat",
-            valid_code(
-                !format.trim().is_empty()
-                    && format.contains("{title}")
-                    && format.contains("{year}"),
-            ),
+            valid_code(crate::probe::check_radarr_indexer_format(Some(&format))),
         );
     }
 
-    if let Some(url) = value(configs, "qbittorrentUrl") {
-        let url_ok = check_url(Some(&url));
-        set(configs, "qbittorrentUrl", valid_code(url_ok));
-        let username = value(configs, "qbittorrentUsername");
-        let password = value(configs, "qbittorrentPassword");
-        let credentials_ok = url_ok && !blank(username.as_deref()) && !blank(password.as_deref());
-        set(configs, "qbittorrentUsername", valid_code(credentials_ok));
-        set(configs, "qbittorrentPassword", valid_code(credentials_ok));
+    let qbittorrent_url = value(configs, "qbittorrentUrl");
+    let qbittorrent_url_ok = state.prober.check_url(qbittorrent_url.as_deref()).await;
+    set(configs, "qbittorrentUrl", valid_code(qbittorrent_url_ok));
+    set(configs, "qbittorrentUsername", 0);
+    set(configs, "qbittorrentPassword", 0);
+    if qbittorrent_url_ok && let Some(url) = qbittorrent_url.as_deref() {
+        let username = value(configs, "qbittorrentUsername").unwrap_or_default();
+        let password = value(configs, "qbittorrentPassword").unwrap_or_default();
+        let logged_in = state
+            .downloaders
+            .qbittorrent
+            .login_with(url, &username, &password)
+            .await;
+        set(configs, "qbittorrentUsername", valid_code(logged_in));
+        set(configs, "qbittorrentPassword", valid_code(logged_in));
     }
 
     if let Some(index) = positions.get("transmissionUrl")
@@ -1118,33 +1154,48 @@ fn apply_config_validation(configs: &mut [SystemConfigRecord]) {
     {
         configs[*index].value = Some(normalize_transmission_url(&url));
     }
-    if let Some(url) = value(configs, "transmissionUrl") {
-        let url_ok = check_url(Some(&url));
-        set(configs, "transmissionUrl", valid_code(url_ok));
-        let username = value(configs, "transmissionUsername");
-        let password = value(configs, "transmissionPassword");
-        let credentials_ok = url_ok && !blank(username.as_deref()) && !blank(password.as_deref());
-        set(configs, "transmissionUsername", valid_code(credentials_ok));
-        set(configs, "transmissionPassword", valid_code(credentials_ok));
+    let transmission_url = value(configs, "transmissionUrl");
+    let transmission_url_ok = state.prober.check_url(transmission_url.as_deref()).await;
+    set(configs, "transmissionUrl", valid_code(transmission_url_ok));
+    set(configs, "transmissionUsername", 0);
+    set(configs, "transmissionPassword", 0);
+    if transmission_url_ok && let Some(url) = transmission_url.as_deref() {
+        let username = value(configs, "transmissionUsername").unwrap_or_default();
+        let password = value(configs, "transmissionPassword").unwrap_or_default();
+        let logged_in = state
+            .downloaders
+            .transmission
+            .login_with(url, &username, &password)
+            .await;
+        set(configs, "transmissionUsername", valid_code(logged_in));
+        set(configs, "transmissionPassword", valid_code(logged_in));
     }
 
     for key in ["jackettUrl", "prowlarrUrl"] {
         if let Some(url) = value(configs, key) {
-            set(configs, key, valid_code(check_url(Some(&url))));
+            set(
+                configs,
+                key,
+                valid_code(state.prober.check_url(Some(&url)).await),
+            );
         }
     }
 
-    let tmdb_url = value(configs, "tmdbUrl");
-    let tmdb_key = value(configs, "tmdbApikey");
-    let tmdb = check_api(tmdb_url.as_deref(), tmdb_key.as_deref());
-    set(configs, "tmdbUrl", valid_code(tmdb >= 1));
-    set(configs, "tmdbApikey", valid_code(tmdb == 2));
+    let tmdb = state
+        .prober
+        .check_tmdb(
+            value(configs, "tmdbUrl").as_deref(),
+            value(configs, "tmdbApikey").as_deref(),
+        )
+        .await;
+    set(configs, "tmdbUrl", valid_code(tmdb.url_valid()));
+    set(configs, "tmdbApikey", valid_code(tmdb.api_key_valid()));
 
     if let Some(regex) = value(configs, "cleanTitleRegex") {
         set(
             configs,
             "cleanTitleRegex",
-            valid_code(Regex::new(&regex).is_ok()),
+            valid_code(crate::probe::check_regex(Some(&regex))),
         );
     }
 }
@@ -1153,13 +1204,16 @@ async fn system_config_update(
     State(state): State<AppState>,
     Json(mut configs): Json<Vec<SystemConfigRecord>>,
 ) -> Response {
-    apply_config_validation(&mut configs);
+    apply_live_validation(&mut configs, &state).await;
     if let Err(error) = admin_db::update_system_config(&state.pool, &configs).await {
         return internal_error("update system config", error);
     }
-    state.sync.clear_all_gates().await;
-    state.formatting_cache.clear().await;
-    state.title_cache.clear().await;
+    // Java evicts the SYSTEM_CONFIG cache and the three title-sync interval
+    // caches. `refresh_config` also drops formatting/title caches so the next
+    // request sees the new formats, languages, URLs and credentials.
+    if let Err(error) = state.refresh_config().await {
+        return internal_error("refresh system config", error);
+    }
     empty_ok()
 }
 
@@ -1169,12 +1223,13 @@ async fn system_config_authors(State(state): State<AppState>) -> Response {
 
 async fn fetch_author_list(state: &AppState) -> Vec<String> {
     const FALLBACK: &str = "LuckyPuppy514";
-    let Some(location) = state.config.rule_locations().into_iter().next() else {
+    let snapshot = state.snapshot();
+    let Some(location) = snapshot.rule_locations().into_iter().next() else {
         return vec![FALLBACK.to_owned()];
     };
     let url = format!("{}/author.json", location.trim_end_matches('/'));
     let request = state.upstream.http_client().get(url).send();
-    let timeout = state.config.request_timeout.min(Duration::from_secs(5));
+    let timeout = snapshot.request_timeout.min(Duration::from_secs(5));
     match tokio::time::timeout(timeout, request).await {
         Ok(Ok(response)) if response.status().is_success() => {
             match response.json::<Vec<String>>().await {
@@ -1229,8 +1284,11 @@ async fn system_cache_clear(
         "indexer_result" => state.result_cache.clear().await,
         "token_black_list" => state.auth.clear_blacklist().await,
         "system_config" => {
-            state.formatting_cache.clear().await;
-            state.title_cache.clear().await;
+            // Java clears the SYSTEM_CONFIG cache, so the next read reloads
+            // the database. Re-resolve now and drop dependent caches.
+            if let Err(error) = state.refresh_config().await {
+                return internal_error("refresh system config", error);
+            }
         }
         "sonarr_title_sync_interval" => {
             state.sync.clear_title_gate(AppKind::Sonarr).await;
