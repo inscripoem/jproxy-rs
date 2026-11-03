@@ -821,6 +821,28 @@ docker run --rm -p 8117:8117 \
 Sonarr/Radarr instance. Supply API keys through your container runtime's secret
 mechanism rather than committing them.
 
+### Published image
+
+Images are published to GitHub Container Registry by
+`.github/workflows/container.yml` when a `v*` tag is pushed, or when the
+workflow is run manually. A stable `vX.Y.Z` tag publishes `X.Y.Z`, `X.Y`, and
+`latest`; the commit is also tagged `sha-<short>`.
+
+```sh
+docker pull ghcr.io/inscripoem/jproxy-rs:latest
+```
+
+For a Compose deployment, pin the tag and pull explicitly when updating:
+
+```sh
+cd /path/to/stack
+docker compose pull jproxy
+docker compose up -d jproxy
+```
+
+The `latest` tag is mutable. Compose does not pull it in the background; with
+`pull_policy: always` it is refreshed on the next `docker compose up`.
+
 ## Notable assumptions and deviations
 
 - **Rule regex flavor.** Rules compile with Rust's `regex` crate, which does not
