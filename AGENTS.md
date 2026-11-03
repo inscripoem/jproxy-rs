@@ -10,11 +10,11 @@ file, follow the operator.
 - `jproxy-rs` is a Rust rewrite of the Java jproxy (`LuckyPuppy514/jproxy`), a
   proxy between Sonarr/Radarr and Prowlarr/Jackett that rewrites Torznab
   queries and item titles.
-- `main` contains the complete 0.1.0 implementation: core proxy, query, title
+- `main` contains the complete 0.1.x implementation: core proxy, query, title
   and rule rewriting, caching, upstream error handling, Sonarr/Radarr/TMDB
   synchronization, downloader login, rename tasks, the admin UI/API and
   authentication, and the operator CLI over the control socket.
-- The 0.1.0 milestone is 1:1 behavior parity with Java before any
+- The 0.1.x milestone is 1:1 behavior parity with Java before any
   simplification. Do not remove, collapse, or "clean up" behavior, response
   shapes, or edge cases just because the Rust version is simpler. Match Java
   unless a deviation is already documented and pinned by a test.

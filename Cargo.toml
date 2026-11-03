@@ -1,6 +1,6 @@
 [package]
 name = "jproxy-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Rust implementation of the jproxy Torznab proxy for Sonarr and Radarr"
 license = "MIT"

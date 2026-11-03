@@ -160,7 +160,7 @@ Health:
 
 ```sh
 curl -fsS http://127.0.0.1:8117/health
-{"status":"ok","version":"0.1.0","database":"ok","result_cache_entries":0}
+{"status":"ok","version":"0.1.1","database":"ok","result_cache_entries":0}
 ```
 
 ## Agent and operator CLI
@@ -518,7 +518,7 @@ Authentication follows the Java controller and interceptor:
 - `/api/system/config/version` queries
   `https://api.github.com/repos/inscripoem/jproxy-rs/releases/latest` (override
   with `VERSION_CHECK_URL`) with a bounded timeout, strips one leading `v` from
-  `tag_name`, compares it with this crate's `CARGO_PKG_VERSION` (`0.1.0`), and
+  `tag_name`, compares it with this crate's `CARGO_PKG_VERSION` (`0.1.1`), and
   appends ` 🚨` on a mismatch. A missing release, non-success status, timeout,
   or parse failure returns the local version unchanged.
 - `/api/system/config/query` runs one Sonarr rename pass before returning the
@@ -953,7 +953,7 @@ The `latest` tag is mutable. Compose does not pull it in the background; with
 - **Admin version check.** `/api/system/config/version` calls this project's
   GitHub `releases/latest` endpoint
   (`inscripoem/jproxy-rs`), with a bounded timeout. It compares the tag with
-  `CARGO_PKG_VERSION` (`0.1.0`). A repository with no release, a failed request,
+  `CARGO_PKG_VERSION` (`0.1.1`). A repository with no release, a failed request,
   or an unparseable response returns the local version without the marker.
   `VERSION_CHECK_URL` exists so tests use a local mock.
 - **Admin credential policy.** A fresh database receives the documented Java

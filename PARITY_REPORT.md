@@ -524,7 +524,7 @@ SSH. All failures are explicit and non-zero.
 
 ### Version
 
-- `/api/system/config/version` reports `CARGO_PKG_VERSION` (`0.1.0`) instead of
+- `/api/system/config/version` reports `CARGO_PKG_VERSION` (`0.1.1`) instead of
   the hard-coded Java `3.4.7`.
 - `VERSION_CHECK_URL` defaults to
   `https://api.github.com/repos/inscripoem/jproxy-rs/releases/latest`. A

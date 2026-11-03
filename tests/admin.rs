@@ -792,35 +792,36 @@ async fn system_config_update_probes_endpoints_and_applies_immediately() {
 #[tokio::test]
 async fn version_endpoint_compares_the_github_release_tag() {
     let env = TestEnv::start().await;
+    let local_version = env!("CARGO_PKG_VERSION");
     let release_path = "/repos/inscripoem/jproxy-rs/releases/latest";
     env.mock.route_path(
         release_path,
-        common::MockResponse::json(r#"{"tag_name":"v0.1.0"}"#),
+        common::MockResponse::json(format!(r#"{{"tag_name":"v{local_version}"}}"#)),
     );
     let router = env.router_with(auth_config(&env, false)).await;
     let token = login(&router, "Anonymous", "Anonymous").await.body;
 
     let version = get_auth(&router, "/api/system/config/version", &token).await;
     assert_eq!(version.status, 200);
-    assert_eq!(version.body, "0.1.0");
+    assert_eq!(version.body, local_version);
 
     env.mock.route_path(
         release_path,
         common::MockResponse::json(r#"{"tag_name":"v9.9.9"}"#),
     );
     let version = get_auth(&router, "/api/system/config/version", &token).await;
-    assert_eq!(version.body, "0.1.0 🚨");
+    assert_eq!(version.body, format!("{local_version} 🚨"));
 
     env.mock
         .route_path(release_path, common::MockResponse::status(500));
     let version = get_auth(&router, "/api/system/config/version", &token).await;
-    assert_eq!(version.body, "0.1.0");
+    assert_eq!(version.body, local_version);
 
     // A repository without a release returns 404; the local version is used.
     env.mock
         .route_path(release_path, common::MockResponse::status(404));
     let version = get_auth(&router, "/api/system/config/version", &token).await;
-    assert_eq!(version.body, "0.1.0");
+    assert_eq!(version.body, local_version);
 }
 
 #[tokio::test]
