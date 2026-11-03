@@ -167,47 +167,133 @@ curl -fsS http://127.0.0.1:8117/health
 
 ## Agent and operator CLI
 
-The same binary provides subcommands for hosts without the admin UI. They open
-`DATABASE_PATH` directly and do not start the HTTP server, so they work through
-`docker exec` or SSH, including while the service is stopped. Every failure is
-reported on stderr and exits non-zero.
+The binary serves the same Axum router on two listeners:
+
+- the TCP Web UI listener (`LISTEN_ADDR`) with the existing login/JWT rules;
+- a Unix-domain control socket for the CLI, authenticated by a per-process
+  control token and Linux peer credentials.
+
+There is no gRPC, D-Bus, or file-watch control plane. Online CLI commands are
+thin HTTP clients over the socket and call the same admin handlers as the Web
+UI; they never edit the database behind a running server.
 
 ```sh
-# Create jproxy or update any existing account. The value is read from stdin
-# and stored as MD5(MD5(password)); it is never printed.
-printf '%s\n' "$ADMIN_PASSWORD" | jproxy-rs admin set-password --stdin
-printf '%s\n' "$ADMIN_PASSWORD" | jproxy-rs admin set-password --username inscripoem --stdin
+# Defaults: /tmp/jproxy/control.sock, /tmp/jproxy/runtime.json, /tmp/jproxy/token
+jproxy-rs status
+jproxy-rs healthcheck
+jproxy-rs version
 
-# Reset the only existing account; fails when the table is empty or ambiguous.
-printf '%s\n' "$ADMIN_PASSWORD" | jproxy-rs admin reset-password --stdin
-
-# system_config access. Credential values are masked unless --reveal is passed.
+# system_config. Credentials are read from stdin or a file, never argv.
 jproxy-rs config list
 jproxy-rs config get sonarrUrl
 jproxy-rs config get sonarrApikey --reveal
 printf '%s\n' "$VALUE" | jproxy-rs config set sonarrApikey --stdin
 jproxy-rs config set cleanTitleRegex --file ./clean-title-regex.txt
 
-# One synchronization pass. SYNC_ENABLED/SYNC_INTERVAL gates are bypassed for
-# an explicit manual run; missing Sonarr/Radarr/TMDB configuration is reported
-# as "skipped".
-jproxy-rs sync --kind sonarr
-jproxy-rs sync --kind all
+# Rules, titles, examples, and TMDB titles (all admin-UI equivalents).
+jproxy-rs rules sonarr list
+jproxy-rs rules sonarr get <id>
+jproxy-rs rules sonarr add --file ./rule.json
+jproxy-rs rules sonarr update <id> --file ./rule.json
+jproxy-rs rules sonarr remove <id> --yes
+jproxy-rs rules sonarr enable <id>
+jproxy-rs rules sonarr disable <id>
+jproxy-rs rules sonarr export --file ./sonarr-rules.json
+jproxy-rs rules sonarr import --file ./sonarr-rules.json
+jproxy-rs titles sonarr list
+jproxy-rs titles sonarr remove <id> --yes
+jproxy-rs titles sonarr sync
+jproxy-rs examples sonarr list
+printf '%s\n' "Synthetic Show S01E01" | jproxy-rs examples sonarr add --stdin
+jproxy-rs examples sonarr remove <hash> --yes
+jproxy-rs tmdb list
+jproxy-rs tmdb add --file ./tmdb-title.json
+jproxy-rs tmdb remove <id> --yes
+jproxy-rs tmdb sync
 
-# Database, config validity, and configured upstream reachability. Prints key
-# names and statuses only, never values.
+# Cache and long-running jobs. Jobs return an id, stream progress over SSE, and
+# can be cancelled.
+jproxy-rs cache list
+jproxy-rs cache clear indexer_result --yes
+jproxy-rs sync --kind sonarr|radarr|tmdb|rules|all [--no-wait]
+jproxy-rs rename --kind sonarr|radarr [--dry-run] [--no-wait]
+jproxy-rs login --client qbittorrent|transmission [--no-wait]
+jproxy-rs jobs list
+jproxy-rs jobs show <id>
+jproxy-rs jobs watch <id>
+jproxy-rs jobs cancel <id>
+
+# Diagnostics.
 jproxy-rs doctor
-jproxy-rs version
+
+# Offline recovery. `admin` always edits DATABASE_PATH directly and refuses to
+# run while a live control socket is present unless --offline is explicit.
+printf '%s\n' "$ADMIN_PASSWORD" | jproxy-rs admin set-password --stdin
+printf '%s\n' "$ADMIN_PASSWORD" | jproxy-rs admin set-password --username inscripoem --stdin
+printf '%s\n' "$ADMIN_PASSWORD" | jproxy-rs admin reset-password --stdin
+```
+
+Global options apply to every command: `--socket <path>`, `--token-file
+<path>`, `--runtime-file <path>`, `--timeout <seconds>`, `--json`,
+`--no-color`, and `--offline`. Without `--socket`, the CLI reads
+`runtime.json` (default `/tmp/jproxy/runtime.json`, override with
+`CONTROL_RUNTIME_FILE`) and the token file it names. Results go to stdout;
+progress and logs go to stderr. Exit codes are `0` success, `2` usage, `3`
+connection failure, `4` authentication failure, `5` server error, and `6`
+CLI/server version mismatch.
+
+`config`, `sync`, and `doctor` fall back to database-direct mode only when no
+control socket exists; the fallback prints an stderr notice. A reachable socket
+with a missing token, bad permission mode, or invalid token is an error, never
+a silent switch to the database. `admin` is the only command that always runs
+offline.
+
+### Control socket security
+
+- `CONTROL_SOCKET` defaults to `/tmp/jproxy/control.sock`, which works for the
+  non-root container user. The parent directory is created with mode `0700`
+  when absent; the socket, token file, `runtime.json`, and `control.lock` are
+  mode `0600`. Set `CONTROL_SOCKET=/control/control.sock` in the container
+  image, where `/control` is owned by UID 65532.
+- A 32-byte random token is base64url-encoded into `<socket-dir>/token`.
+  `runtime.json` records `socket`, `pid`, `version`, `token_file`, and
+  `started_at`, never the token itself. Neither value is logged.
+- On Linux the server verifies `SO_PEERCRED`: only the service UID and root are
+  accepted. Other users are rejected before the token is checked. On other
+  Unix systems `getpeereid` is used; if peer credentials are unavailable the
+  request is rejected.
+- `docker exec` defaults to the image user for entrypoint processes, so a plain
+  `docker exec <container> jproxy-rs status` works. `docker exec -u <uid>` must
+  use the service UID (65532 in the image) or `0`; any other UID fails the
+  peer-credential check even with a valid token.
+- Startup takes an exclusive `flock` on `<socket-dir>/control.lock`. An
+  existing socket is unlinked only after a failed connect probe; a live
+  listener is never removed. Graceful shutdown removes the socket, token, and
+  runtime metadata. A crash leaves stale files, and the next start replaces
+  them.
+- Unix socket paths are limited to roughly 108 bytes on Linux. Longer
+  `CONTROL_SOCKET` values are rejected before binding.
+- The control token is accepted only on the Unix listener. On TCP it is not an
+  auth bypass: `/api/control/**` requires the UDS principal, and admin routes
+  still require a JWT.
+
+In a container:
+
+```sh
+docker exec <container> jproxy-rs status
+docker exec <container> jproxy-rs sync --kind sonarr
+docker exec -u 65532 <container> jproxy-rs jobs list
 ```
 
 `admin set-password` with no `--username` uses `ADMIN_USERNAME`, then the sole
 existing account, then `jproxy`. This means a migrated database containing only
 `inscripoem` is updated in place rather than gaining a second administrator.
-`admin reset-password` updates the sole existing account, which is how a
-migrated database with only `inscripoem` is reset. `config set` accepts only the
-whitelisted `system_config` keys listed under Configuration and marks the row
-valid. `config get`/`list` mask `sonarrApikey`, `radarrApikey`, `tmdbApikey`,
-`qbittorrentPassword`, and `transmissionPassword`.
+`admin reset-password` updates the sole existing account. `config set` accepts
+only the whitelisted `system_config` keys listed under Configuration and marks
+the row valid. `config get`/`list` mask `sonarrApikey`, `radarrApikey`,
+`tmdbApikey`, `qbittorrentPassword`, and `transmissionPassword` unless
+`--reveal` is passed. Destructive commands (`rules remove`, `titles remove`,
+`examples remove`, `tmdb remove`, `cache clear`) require `--yes`.
 
 ## Real data import
 
@@ -298,6 +384,7 @@ All other settings remain environment-only.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `LISTEN_ADDR` | `0.0.0.0:8117` | HTTP listen socket. |
+| `CONTROL_SOCKET` | `/tmp/jproxy/control.sock` | Unix-domain socket for the CLI control channel. The parent directory is created `0700`; the socket and metadata are `0600`. |
 | `DATABASE_PATH` | `./jproxy.db` | SQLite file. Missing tables are created. |
 | `PROWLARR_URL` | unset | Prowlarr base URL. |
 | `JACKETT_URL` | unset | Jackett base URL. |
@@ -372,6 +459,7 @@ All admin endpoints use the Java paths, methods, camelCase JSON fields, and
 | `/api/system/config` | `GET version`, `GET query`, `POST update`, `GET author/list` |
 | `/api/system/user` | `POST login`, `POST logout`, `GET info`, `POST update`, `GET isLoginEnabled` |
 | `/api/system/cache` | `POST clear`, `POST clearAll` |
+| `/api/control` | UDS-only: `GET status`, `POST reload`, `POST sync`, `POST rename`, `POST login`, `GET/POST jobs`, `GET jobs/{id}`, `GET jobs/{id}/events` (SSE), `POST jobs/{id}/cancel` |
 
 Authentication follows the Java controller and interceptor:
 
@@ -402,6 +490,10 @@ Authentication follows the Java controller and interceptor:
   (minutes) controls expiry. Tokens become invalid after a process restart.
   Logout blacklists the raw `Authorization` header. More than ten wrong logins
   block login until restart, as in Java.
+- `/api/control/**` is reachable only through the Unix listener with the
+  control token (`X-Control-Token` or `Authorization: Bearer <token>`). A
+  valid Web UI JWT on TCP receives `403` for these paths, and the control token
+  on TCP never authenticates an admin route.
 - `/api/system/config/update` reproduces Java's live validation:
   - Sonarr/Radarr: `GET {url}/api/v3/health?apikey=...` with
     `PROBE_CONNECT_TIMEOUT_SECS` (default 6) and `PROBE_READ_TIMEOUT_SECS`

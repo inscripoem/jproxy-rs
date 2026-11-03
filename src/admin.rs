@@ -95,6 +95,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/system/user/info", get(system_user_info))
         .route("/api/system/user/update", post(system_user_update))
         .route("/api/system/user/logout", post(system_user_logout))
+        // Control endpoints are reached only through the UDS listener; the
+        // route layer inside `control::router` requires its principal.
+        .merge(crate::control::router())
         // Java's interceptor protects every /api path, including unknown ones.
         .route("/api/{*rest}", any(reserved_not_found))
         .route_layer(middleware::from_fn_with_state(auth, auth::require_admin));

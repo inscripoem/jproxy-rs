@@ -152,6 +152,18 @@ impl SyncState {
         }
         self.clear_tmdb_gate().await;
     }
+
+    /// Seconds until the title-sync gate opens, or `None` when it is open.
+    pub async fn title_gate_remaining(&self, kind: AppKind, interval: Duration) -> Option<u64> {
+        let gate = self.title_gate(kind).lock().await;
+        gate.map(|instant| interval.saturating_sub(instant.elapsed()).as_secs())
+    }
+
+    /// Seconds until the TMDB-sync gate opens, or `None` when it is open.
+    pub async fn tmdb_gate_remaining(&self, interval: Duration) -> Option<u64> {
+        let gate = self.tmdb_gate.lock().await;
+        gate.map(|instant| interval.saturating_sub(instant.elapsed()).as_secs())
+    }
 }
 
 impl Default for SyncState {

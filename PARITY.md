@@ -57,6 +57,9 @@ reviewed:
 - Admin UI, login/session, and management REST APIs.
 - Operator/agent CLI for admin credentials, `system_config`, one-shot sync,
   diagnostics, and version reporting.
+- Unix-domain control channel serving the same Axum router, with token and
+  peer-credential authentication, job ids, SSE progress, cancellation, rename
+  dry-run, downloader login, and a CLI equivalent to the admin UI.
 - Example/cache/system-config REST endpoints.
 - Resource target: total below 100 MB RSS.
 

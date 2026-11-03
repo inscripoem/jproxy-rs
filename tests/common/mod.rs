@@ -515,6 +515,7 @@ impl TestEnv {
     pub fn config(&self) -> Config {
         Config {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
+            control_socket: self._dir.path().join("control.sock"),
             database_path: self.db_path.clone(),
             prowlarr_url: Some(self.mock.base_url()),
             jackett_url: None,

@@ -77,8 +77,11 @@ the gate pass.
   - `tests/sync.rs` — title, TMDB, rule, and on-demand synchronization.
   - `tests/admin.rs` — admin CRUD, login/JWT rejection, cache/config
     endpoints, pagination, static UI serving.
-  - `tests/cli.rs` — `admin`, `config`, `sync`, `doctor`, and `version`
+  - `tests/cli.rs` — offline `admin`/`config`/`sync`/`doctor`/`version`
     subcommands against temporary databases and local mocks.
+  - `tests/control.rs` — UDS token/peer authentication, TCP isolation, stale
+    socket handling, job/SSE/rename-dry-run/login flows, admin CRUD through the
+    control token, and online CLI exit codes and command surface.
   - `tests/downloaders.rs` — qBittorrent/Transmission sessions and errors.
   - `tests/rename.rs` — Sonarr/Radarr history rename flows.
   - `tests/upstream_errors.rs` — retry, concurrency, and downstream status
@@ -141,11 +144,12 @@ gitignored. Never force-add them.
 
 ## Architecture map
 
-- `src/main.rs` — binary entry point, startup, shutdown, `import`, and
-  subcommand dispatch.
-- `src/cli.rs` — `admin`, `config`, `sync`, `doctor`, and `version`
-  subcommands. They open the SQLite database directly and never start the
-  server.
+- `src/main.rs` — binary entry point, startup and shutdown of both the TCP and
+  Unix-domain listeners, `import`, and subcommand dispatch.
+- `src/cli.rs` — online CLI commands over the Unix control socket plus the
+  explicit offline `admin`/`config` paths.
+- `src/control.rs` — Unix socket lifecycle, token/runtime files, peer-credential
+  checks, control middleware/endpoints, and the bounded job manager with SSE.
 - `src/app.rs` — Axum router, shared `AppState`, proxy flow, health, static UI
   fallback, and upstream request orchestration.
 - `src/admin.rs` — Java-compatible admin REST handlers, config validation, and
@@ -193,6 +197,11 @@ gitignored. Never force-add them.
   key; `cleanTitleRegex`; `ruleSyncAuthors`; rule locations; and
   qBittorrent/Transmission URL, username, and password. `system_user` is read
   only to verify admin login. Downloader credentials stay in memory.
+- `CONTROL_SOCKET` is environment-only. It defaults to
+  `/tmp/jproxy/control.sock`; token and `runtime.json` live beside it. The
+  socket, token, and metadata are `0600`, the directory is created `0700`, and
+  Linux peer credentials must report the service UID or root. Never log the
+  control token or socket payloads.
 - Configuration is a shared snapshot. A successful
   `/api/system/config/update` or `/api/system/cache/clear` with
   `cacheName=system_config` re-reads the database and applies new values
@@ -250,9 +259,15 @@ gitignored. Never force-add them.
 - A valid out-of-range page returns HTTP 200 with the requested coordinates,
   the real total, and an empty list. Do not reintroduce the MyBatis page-one
   restart or Java's `subList` exception.
-- CLI subcommands must never start the HTTP server, must read `DATABASE_PATH`
-  directly, must exit non-zero on failure, and must mask secret
-  `system_config` values unless `--reveal` is passed.
+- CLI subcommands must never start the HTTP server. Online commands speak to
+  the Unix control socket and reuse the admin handlers; they must not edit the
+  database of a running process. `admin` is always an explicit offline
+  database operation and refuses to run while a live control socket exists
+  unless `--offline` is passed. `config`, `sync`, and `doctor` may fall back to
+  direct database access only when no control socket exists, with a stderr
+  notice; a reachable socket with a bad token or permission mode is an error.
+  Every command exits non-zero on failure, masks secret `system_config` values
+  unless `--reveal` is passed, and requires `--yes` for destructive operations.
 
 ## Git and scope
 

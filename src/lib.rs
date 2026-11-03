@@ -5,6 +5,7 @@ pub mod auth;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod control;
 pub mod db;
 pub mod downloader;
 pub mod formatting;

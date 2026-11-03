@@ -252,6 +252,14 @@ impl AuthState {
     }
 }
 
+/// Marker inserted by the UDS control listener after the peer UID and control
+/// token have been verified. TCP requests never carry it, so the control token
+/// cannot be used as an authentication bypass on the Web UI listener.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ControlPrincipal {
+    pub uid: Option<u32>,
+}
+
 /// Reject unprotected admin API access with `403`, as Java's
 /// `LoginInterceptor` does.
 pub async fn require_admin(
@@ -259,6 +267,15 @@ pub async fn require_admin(
     mut request: Request,
     next: Next,
 ) -> Response {
+    if request.extensions().get::<ControlPrincipal>().is_some() {
+        request.extensions_mut().insert(AuthUser {
+            username: Some("control".to_owned()),
+            role: Some("admin".to_owned()),
+            valid_status: Some(1),
+            ..AuthUser::default()
+        });
+        return next.run(request).await;
+    }
     let authorization = request
         .headers()
         .get(header::AUTHORIZATION)

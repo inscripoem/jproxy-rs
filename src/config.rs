@@ -31,6 +31,9 @@ pub const DEFAULT_VERSION_CHECK_URL: &str =
 pub const DEFAULT_PROBE_CONNECT_TIMEOUT_SECS: u64 = 6;
 pub const DEFAULT_PROBE_READ_TIMEOUT_SECS: u64 = 12;
 pub const DEFAULT_DOWNLOADER_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Unix-domain control socket. `/tmp/jproxy` is writable by the non-root
+/// container user and is created with mode `0700` on first start.
+pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/jproxy/control.sock";
 
 /// The `system_config` keys this service is allowed to read.
 ///
@@ -220,6 +223,8 @@ fn compile_clean_regex(source: &str) -> Regex {
 #[derive(Clone)]
 pub struct Config {
     pub listen_addr: SocketAddr,
+    /// Unix-domain socket for the CLI control channel.
+    pub control_socket: PathBuf,
     pub database_path: PathBuf,
     pub prowlarr_url: Option<String>,
     pub jackett_url: Option<String>,
@@ -296,6 +301,9 @@ impl Config {
         let database_path = env_string("DATABASE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./jproxy.db"));
+        let control_socket = env_string("CONTROL_SOCKET")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROL_SOCKET));
 
         let cache_expires =
             Duration::from_secs(env_minutes("CACHE_EXPIRES", 4320)?.saturating_mul(60));
@@ -308,6 +316,7 @@ impl Config {
 
         Ok(Self {
             listen_addr,
+            control_socket,
             database_path,
             prowlarr_url: env_string("PROWLARR_URL"),
             jackett_url: env_string("JACKETT_URL"),
@@ -569,8 +578,9 @@ impl Config {
     /// lists, or rule locations.
     pub fn startup_summary(&self) -> String {
         format!(
-            "listen={} database={} min_count={} sync_enabled={} sync_interval={}s cache_ttl={}s result_cache_ttl={}s cache_max_entries={} rename_file={} login_enabled={} sonarr_sync={} radarr_sync={} tmdb_sync={} rule_sync={} qbittorrent={} transmission={} sonarr_rename_fallback={}s radarr_rename_fallback={}s languages={},{} ondemand_timeout={}s upstream_concurrency={} upstream_retries={} schedule=java-cron",
+            "listen={} control_socket={} database={} min_count={} sync_enabled={} sync_interval={}s cache_ttl={}s result_cache_ttl={}s cache_max_entries={} rename_file={} login_enabled={} sonarr_sync={} radarr_sync={} tmdb_sync={} rule_sync={} qbittorrent={} transmission={} sonarr_rename_fallback={}s radarr_rename_fallback={}s languages={},{} ondemand_timeout={}s upstream_concurrency={} upstream_retries={} schedule=java-cron",
             self.listen_addr,
+            self.control_socket.display(),
             self.database_path.display(),
             self.min_count,
             self.sync_enabled,
@@ -750,6 +760,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
+            control_socket: PathBuf::from("/tmp/jproxy-test/control.sock"),
             database_path: PathBuf::from(":memory:"),
             prowlarr_url: None,
             jackett_url: None,

@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -27,13 +27,13 @@ static EPISODE_IN_FILE_NAME: LazyLock<Regex> =
 static SUBTITLE_EXTENSION_FULL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:\.(ass|srt|ssa|idx|sub))$").expect("static regex"));
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LoginReport {
     pub qbittorrent: bool,
     pub transmission: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RenameReport {
     /// No downloader was logged in; the task returned before fetching history.
     pub skipped: bool,
@@ -41,6 +41,35 @@ pub struct RenameReport {
     pub renamed_torrents: usize,
     pub renamed_files: usize,
     pub errors: usize,
+    /// Read-only pass: no rename request was sent to the downloader.
+    pub dry_run: bool,
+    /// Items that a real pass would attempt to rename.
+    pub planned_torrents: usize,
+    /// Files inside qBittorrent torrents that a real pass would rename.
+    pub planned_files: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloaderKind {
+    Qbittorrent,
+    Transmission,
+}
+
+impl DownloaderKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "qbittorrent" => Some(Self::Qbittorrent),
+            "transmission" => Some(Self::Transmission),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Qbittorrent => "qbittorrent",
+            Self::Transmission => "transmission",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +181,45 @@ pub async fn login_once(state: &AppState) -> LoginReport {
     report
 }
 
+/// Log in to one downloader selected by the control CLI. Returns `false` when
+/// the downloader is not configured or rejects the credentials. Credentials
+/// are read from the live configuration snapshot and never returned.
+pub async fn login_client(state: &AppState, kind: DownloaderKind) -> bool {
+    let snapshot = state.snapshot();
+    match kind {
+        DownloaderKind::Qbittorrent => {
+            let Some((url, username, password)) = downloader_credentials(
+                &snapshot,
+                "qbittorrentUrl",
+                "qbittorrentUsername",
+                "qbittorrentPassword",
+            ) else {
+                return false;
+            };
+            state
+                .downloaders
+                .qbittorrent
+                .login_with(&url, &username, &password)
+                .await
+        }
+        DownloaderKind::Transmission => {
+            let Some((url, username, password)) = downloader_credentials(
+                &snapshot,
+                "transmissionUrl",
+                "transmissionUsername",
+                "transmissionPassword",
+            ) else {
+                return false;
+            };
+            state
+                .downloaders
+                .transmission
+                .login_with(&url, &username, &password)
+                .await
+        }
+    }
+}
+
 fn downloader_credentials(
     snapshot: &crate::config::ConfigSnapshot,
     url_key: &str,
@@ -184,8 +252,25 @@ pub async fn radarr_rename_once(state: &AppState) -> Result<RenameReport> {
     rename_once(state, AppKind::Radarr).await
 }
 
+/// Run one rename pass. `dry_run` only reads history and qBittorrent file
+/// lists; no rename endpoint is called.
+pub async fn rename_once_with_options(
+    state: &AppState,
+    kind: AppKind,
+    dry_run: bool,
+) -> Result<RenameReport> {
+    rename_once_inner(state, kind, dry_run).await
+}
+
 async fn rename_once(state: &AppState, kind: AppKind) -> Result<RenameReport> {
-    let mut report = RenameReport::default();
+    rename_once_inner(state, kind, false).await
+}
+
+async fn rename_once_inner(state: &AppState, kind: AppKind, dry_run: bool) -> Result<RenameReport> {
+    let mut report = RenameReport {
+        dry_run,
+        ..RenameReport::default()
+    };
     if !state.downloaders.any_logged_in().await {
         report.skipped = true;
         return Ok(report);
@@ -236,14 +321,20 @@ async fn rename_once(state: &AppState, kind: AppKind) -> Result<RenameReport> {
             source_title,
             item.data.as_ref(),
             formatter.as_ref(),
+            dry_run,
         )
         .await
         {
             Ok(outcome) => {
-                if outcome.torrent_renamed {
-                    report.renamed_torrents += 1;
+                if dry_run {
+                    report.planned_torrents += usize::from(outcome.torrent_renamed);
+                    report.planned_files += outcome.files_renamed;
+                } else {
+                    if outcome.torrent_renamed {
+                        report.renamed_torrents += 1;
+                    }
+                    report.renamed_files += outcome.files_renamed;
                 }
-                report.renamed_files += outcome.files_renamed;
             }
             Err(error) => {
                 report.errors += 1;
@@ -278,9 +369,14 @@ async fn process_item(
     source_title: &str,
     data: Option<&HistoryData>,
     formatter: Option<&RenameFormatter>,
+    dry_run: bool,
 ) -> Result<ItemOutcome> {
     let mut outcome = ItemOutcome::default();
     if download_client_is_transmission(data) {
+        if dry_run {
+            outcome.torrent_renamed = true;
+            return Ok(outcome);
+        }
         outcome.torrent_renamed = state
             .downloaders
             .transmission
@@ -288,6 +384,29 @@ async fn process_item(
             .await?;
         if outcome.torrent_renamed {
             info!(%hash, %source_title, "Transmission torrent renamed");
+        }
+        return Ok(outcome);
+    }
+
+    if dry_run {
+        // A real qBittorrent pass renames the torrent first and then lists its
+        // files. Reporting a planned torrent is therefore accurate without
+        // asking the downloader to change anything.
+        outcome.torrent_renamed = true;
+        if state.snapshot().rename_file {
+            outcome.files_renamed = match kind {
+                AppKind::Sonarr => plan_sonarr_files(
+                    &state.downloaders,
+                    hash,
+                    source_title,
+                    formatter.expect("Sonarr rename formatter"),
+                )
+                .await?
+                .len(),
+                AppKind::Radarr => plan_radarr_files(&state.downloaders, hash, source_title)
+                    .await?
+                    .len(),
+            };
         }
         return Ok(outcome);
     }
@@ -333,8 +452,25 @@ async fn rename_sonarr_files(
     source_title: &str,
     formatter: &RenameFormatter,
 ) -> Result<usize> {
+    let plans = plan_sonarr_files(downloaders, hash, source_title, formatter).await?;
+    for (old_path, new_path) in &plans {
+        downloaders
+            .qbittorrent
+            .rename_file(hash, old_path, new_path)
+            .await?;
+        info!(%old_path, %new_path, "qBittorrent file renamed");
+    }
+    Ok(plans.len())
+}
+
+async fn plan_sonarr_files(
+    downloaders: &crate::downloader::Downloaders,
+    hash: &str,
+    source_title: &str,
+    formatter: &RenameFormatter,
+) -> Result<Vec<(String, String)>> {
     let mut subtitle_no = 1;
-    let mut renamed = 0;
+    let mut plans = Vec::new();
     let mut new_name_format = formatter.format(source_title, "{season}", true, true);
     new_name_format.push_str("{episode}");
 
@@ -370,14 +506,9 @@ async fn rename_sonarr_files(
         }
 
         let new_path = renamed_path(&old_path, last_index, source_title, &new_file_name);
-        downloaders
-            .qbittorrent
-            .rename_file(hash, &old_path, &new_path)
-            .await?;
-        renamed += 1;
-        info!(%old_file_name, %new_file_name, "qBittorrent file renamed");
+        plans.push((old_path, new_path));
     }
-    Ok(renamed)
+    Ok(plans)
 }
 
 async fn rename_radarr_files(
@@ -385,8 +516,24 @@ async fn rename_radarr_files(
     hash: &str,
     source_title: &str,
 ) -> Result<usize> {
+    let plans = plan_radarr_files(downloaders, hash, source_title).await?;
+    for (old_path, new_path) in &plans {
+        downloaders
+            .qbittorrent
+            .rename_file(hash, old_path, new_path)
+            .await?;
+        info!(%old_path, %new_path, "qBittorrent file renamed");
+    }
+    Ok(plans.len())
+}
+
+async fn plan_radarr_files(
+    downloaders: &crate::downloader::Downloaders,
+    hash: &str,
+    source_title: &str,
+) -> Result<Vec<(String, String)>> {
     let mut subtitle_no = 1;
-    let mut renamed = 0;
+    let mut plans = Vec::new();
 
     for old_path in downloaders.qbittorrent.files(hash).await? {
         let last_index = path_split_index(&old_path);
@@ -409,14 +556,9 @@ async fn rename_radarr_files(
         }
 
         let new_path = renamed_path(&old_path, last_index, source_title, &new_file_name);
-        downloaders
-            .qbittorrent
-            .rename_file(hash, &old_path, &new_path)
-            .await?;
-        renamed += 1;
-        info!(%old_file_name, %new_file_name, "qBittorrent file renamed");
+        plans.push((old_path, new_path));
     }
-    Ok(renamed)
+    Ok(plans)
 }
 
 fn path_split_index(path: &str) -> usize {

@@ -26,6 +26,10 @@ fn run_cli_with_env(
     command
         .args(args)
         .env("DATABASE_PATH", database)
+        // Keep the CLI on its documented offline fallback even when a control
+        // socket happens to exist on the build host.
+        .env("CONTROL_SOCKET", database.with_file_name("no-control.sock"))
+        .env_remove("CONTROL_RUNTIME_FILE")
         .env_remove("ADMIN_USERNAME")
         .env_remove("ADMIN_PASSWORD");
     for name in [

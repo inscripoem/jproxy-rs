@@ -18,6 +18,7 @@ Extra features on `features/full-parity` (not pushed, not merged):
 - `17c9d1f` — `jproxy-rs: admin ui api auth parity`.
 - `817e37b` — `jproxy-rs: finalize parity report`.
 - `7fa1c1e` — `jproxy-rs: strict java parity fixes`.
+- `(this commit)` — `jproxy-rs: add uds control channel and admin cli`.
 
 Feature worktree: `~/dev/jproxy-rs-features`, branch `features/full-parity`.
 All planned feature phases are implemented and tested; merge awaits review.
@@ -542,3 +543,123 @@ SSH. All failures are explicit and non-zero.
 - The page-one overflow restart and the `subList` exception are intentionally
   not reproduced, as documented above.
 - Java's Caffeine cache internals remain out of scope.
+
+## UDS control channel and full admin CLI phase (2026-11-03)
+
+This phase adds an operator control plane; the Java reference has no Unix
+socket or job API, so nothing here replaces or removes a Java behavior. The
+existing TCP router, Web UI login/JWT rules, admin handlers, proxy routes,
+sync/rename tasks, and response shapes are unchanged.
+
+### Implemented
+
+- `src/control.rs` serves the same Axum router on a Unix-domain socket.
+  - `CONTROL_SOCKET` defaults to `/tmp/jproxy/control.sock`. The parent
+    directory is created `0700` when absent; the socket, `token`,
+    `runtime.json`, and `control.lock` are `0600`.
+  - A 32-byte random token is base64url-encoded into `<socket-dir>/token`.
+    `runtime.json` records `socket`, `pid`, `version`, `token_file`,
+    `started_at`, and the peer policy, never the token.
+  - Startup takes an exclusive `flock` on `control.lock`. A pre-existing socket
+    is removed only after a failed connect probe; a live listener is never
+    unlinked. Graceful shutdown removes the socket, token, and runtime file.
+  - Linux `SO_PEERCRED` (and `getpeereid` on other Unix systems) restricts
+    access to the service UID and root. Missing peer credentials are rejected.
+  - Socket paths of 107 bytes or more are rejected before binding.
+- UDS authentication middleware maps `X-Control-Token` or
+  `Authorization: Bearer <control token>` to an admin principal
+  (`auth::ControlPrincipal`) and strips the credential headers. The TCP
+  listener never inserts that principal, so the control token cannot
+  authenticate an admin route there, and `/api/control/**` returns `403` over
+  TCP even with a valid Web UI JWT.
+- Control endpoints: `GET /api/control/status`, `POST /api/control/reload`,
+  `POST /api/control/sync?kind=sonarr|radarr|tmdb|rules|all`,
+  `POST /api/control/rename?kind=sonarr|radarr[&dry_run=true]`,
+  `POST /api/control/login?client=qbittorrent|transmission`, and
+  `GET|POST /api/control/jobs`, `GET /api/control/jobs/{id}`,
+  `GET /api/control/jobs/{id}/events` (SSE), `POST /api/control/jobs/{id}/cancel`.
+  Sync, rename, and login return a job id; jobs retain at most 200 events and
+  report dropped events.
+- Status reports version, PID, uptime, config validity (key names only),
+  sync gates, downloader configuration/login state, cache entries, job counts,
+  and control metadata without secrets.
+- Rename dry-run is read-only: it fetches history and, when file renaming is
+  enabled, lists qBittorrent files to report planned torrent/file counts. No
+  rename endpoint is called. A real pass was refactored onto the same file
+  planning helpers without changing behavior.
+- `src/cli.rs` now covers the admin UI surface over UDS: `status`,
+  `healthcheck`, `version`, `config get|set|list`, `rules`, `titles`,
+  `examples`, `tmdb`, `cache`, `sync`, `rename`, `login`, `jobs`, and `doctor`.
+  Global options are `--socket`, `--token-file`, `--runtime-file`, `--timeout`,
+  `--json`, `--no-color`, and `--offline`. Exit codes are `0` success, `2`
+  usage, `3` connection, `4` authentication, `5` server, and `6` version
+  mismatch. Results go to stdout; progress/logs go to stderr.
+- Secrets are read from stdin or `--file`, never argv. `config get|list` mask
+  the five credential keys unless `--reveal`; destructive commands require
+  `--yes`.
+- `admin` remains the explicit offline recovery path and refuses to run while a
+  control socket is live unless `--offline` is passed. `config`, `sync`, and
+  `doctor` use direct database access only when no control socket exists, with
+  an stderr notice; a reachable socket with a missing token, bad mode, or bad
+  token is an error.
+- `Dockerfile` creates `/control` (`0700`, UID 65532), sets
+  `CONTROL_SOCKET=/control/control.sock`, and declares it a volume. The image
+  remains non-root.
+
+### Verification
+
+All verification used release/debug binaries built from this worktree,
+temporary SQLite databases, temporary sockets, child-process CLI runs, and
+loopback mocks. No NAS, Java service, or real downloader was contacted.
+
+- `nix develop --command cargo fmt --check`: pass.
+- `nix develop --command cargo clippy --all-targets -- -D warnings`: pass.
+- `nix develop --command cargo test`: **175 passed, 0 failed** — 89 unit, 22
+  admin, 9 CLI, 5 downloader, 10 parity, 3 real-data, 7 rename, 14 sync, 6
+  upstream-error, and 10 control. New control coverage: token auth on UDS,
+  TCP rejecting the control token and control endpoints, stale-socket cleanup
+  and live-lock refusal, status/reload, admin rule CRUD through the control
+  token, sync job + SSE, job cancellation, downloader login and rename dry-run
+  with no downloader mutation, CLI exit codes (0/2/3/4/5/6), the online
+  command surface, examples/rules writes over stdin, and the explicit offline
+  config fallback.
+- `nix develop --command cargo build --release`: pass.
+
+### Resource measurements
+
+Measured on this host with the release binary (`strip`, `opt-level=z`), a
+temporary database, a local Python Torznab mock, and `SYNC_ENABLED=false`:
+
+| Phase | RSS |
+| --- | ---: |
+| Idle after startup | 11.8 MB |
+| After 600 control `status` requests at concurrency 8 | 13.1 MB |
+| After 1,200 proxy queries at concurrency 16, 1,000 result-cache entries | 21.5 MB |
+
+These are synthetic, local-mock measurements; no live A/B or NAS measurement
+was performed.
+
+### Deviations and assumptions for this phase
+
+- The UDS control channel, `/api/control/**`, job ids, SSE, and the expanded
+  CLI are project extensions. They are not Java parity behavior and do not
+  change any Java-compatible endpoint.
+- The TCP Web UI listener does not serve the control endpoints. This is
+  deliberate: the control token must not become a second Web UI authentication
+  mechanism.
+- Job cancellation is cooperative. Cancelling drops the running Rust future;
+  an HTTP request already accepted by a downloader may still take effect
+  remotely. Job status becomes `cancelled` locally.
+- Rename dry-run reports planned counts, not a downloader-validated rename. It
+  avoids all mutating qBittorrent/Transmission calls.
+- Peer-credential checking is native to Unix. Non-Linux Unix uses
+  `getpeereid`; if the platform cannot report peer credentials, control
+  requests are rejected rather than allowed.
+- The parent directory is forced to `0700` only when the service creates it or
+  when it is the default `/tmp/jproxy`; a caller-supplied existing shared
+  directory is left with its own mode.
+- `CONTROL_RUNTIME_FILE` is CLI-only. The server always writes
+  `runtime.json`, `token`, and `control.lock` beside the configured socket.
+- The CLI compares `runtime.json`'s version with its own crate version and
+  exits `6` on mismatch. An explicit `--socket` without readable runtime
+  metadata skips that check.
