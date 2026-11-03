@@ -29,9 +29,34 @@ type HmacSha256 = Hmac<Sha256>;
 /// Java blocks once `loginWrongCount > 10`, so ten failures are allowed.
 pub const MAX_WRONG_LOGINS: u32 = 10;
 
-/// The upstream default account, created by the first-run migration.
+/// The upstream default account, created by the first-run seed.
 pub const DEFAULT_USERNAME: &str = "jproxy";
+pub const DEFAULT_PASSWORD: &str = "jproxy@2023";
 pub const DEFAULT_PASSWORD_HASH: &str = "765EB35667C4323E7CCB88C94C223202";
+
+/// Resolve the first-run admin credentials without ever logging them.
+///
+/// `ADMIN_USERNAME`/`ADMIN_PASSWORD` override the Java defaults only when the
+/// `system_user` table is empty. Blank values fall back to the defaults.
+pub fn first_run_admin_credentials(
+    username: Option<String>,
+    password: Option<String>,
+) -> (String, String) {
+    let username = username
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_USERNAME.to_owned());
+    let password = password
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_PASSWORD.to_owned());
+    (username, password)
+}
+
+/// Store the same value Java persists for a typed password: the MD5 of the
+/// MD5 the compiled UI submits, uppercase.
+pub fn stored_password_hash(password: &str) -> String {
+    md5_upper(&md5_upper(password))
+}
 
 /// MD5 of `value`, uppercase. This is the single hash the Java service applies
 /// to the password submitted by the UI (which is already an MD5 digest).
@@ -254,6 +279,37 @@ pub fn authorization_header(headers: &HeaderMap) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_credentials_match_the_upstream_seed() {
+        assert_eq!(
+            first_run_admin_credentials(None, None),
+            (DEFAULT_USERNAME.to_owned(), DEFAULT_PASSWORD.to_owned())
+        );
+        assert_eq!(
+            stored_password_hash(DEFAULT_PASSWORD),
+            DEFAULT_PASSWORD_HASH
+        );
+        assert_eq!(
+            md5_upper(DEFAULT_PASSWORD),
+            "D7FD102352432BC8D92B6023EDF4B28A"
+        );
+    }
+
+    #[test]
+    fn environment_credentials_override_defaults_and_blank_values_do_not() {
+        assert_eq!(
+            first_run_admin_credentials(
+                Some("operator".to_owned()),
+                Some("synthetic-password".to_owned())
+            ),
+            ("operator".to_owned(), "synthetic-password".to_owned())
+        );
+        assert_eq!(
+            first_run_admin_credentials(Some("   ".to_owned()), Some(String::new())),
+            (DEFAULT_USERNAME.to_owned(), DEFAULT_PASSWORD.to_owned())
+        );
+    }
 
     #[test]
     fn ui_password_hash_matches_the_upstream_seed() {

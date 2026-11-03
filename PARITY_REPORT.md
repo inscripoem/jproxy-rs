@@ -428,3 +428,117 @@ or `/mnt/user` write was used.
   `REQUEST_TIMEOUT_SECS` (30 s) rather than Java's 15-minute RestTemplate.
 - No live A/B was performed against a real Sonarr/Radarr/TMDB/downloader or the
   NAS service; all probes and loads used local mocks.
+
+## Final admin, CLI, pagination, timeout and version phase (2026-11-03)
+
+Commit on `features/full-parity`: `jproxy-rs: finalize admin and agent
+controls` (not pushed). This phase fixes the admin credential policy, adds the
+operator CLI, makes pagination non-destructive, exposes bounded timeouts, and
+points the version check at this repository. It supersedes the corresponding
+earlier deviations above.
+
+### Admin credentials (final policy)
+
+- A fresh database with no `system_user` rows receives `jproxy` /
+  `jproxy@2023`, enabled, matching Java. `ADMIN_USERNAME` / `ADMIN_PASSWORD`
+  override the defaults for that first insert only.
+- The stored value is uppercase `MD5(MD5(password))`, the format Java uses for
+  a value hashed once by the compiled UI and once by the service.
+  `ADMIN_PASSWORD` and CLI stdin are interpreted as the plaintext password;
+  callers that already hold the UI-submitted MD5 must hash it once before
+  providing it.
+- Existing `system_user` rows are preserved exactly. A migrated Java database
+  whose account is `inscripoem` is never renamed, reset, or duplicated, and the
+  default `jproxy` row is not added beside it. The SQL seed no longer contains
+  a user insert; `db::seed_first_run_admin` performs one conditional insert.
+- `LOGIN_ENABLED` now defaults to `true`, matching
+  `application-prod.yml` (`${LOGIN_ENABLED:true}`). The admin UI/API remain
+  LAN-accessible and require login; the Torznab routes and `/health` remain
+  public.
+- There is no setup wizard, setup token, secret file, or forced first-login
+  change.
+- Startup logs one warning when the default credential hash is still stored
+  and the listener is bound to a non-loopback address. It never logs the
+  password, hash, or environment value.
+
+### Operator CLI
+
+`jproxy-rs admin|config|sync|doctor|version` runs without starting the HTTP
+server and opens `DATABASE_PATH` directly, so it works through `docker exec` or
+SSH. All failures are explicit and non-zero.
+
+- `admin set-password [--username <name>] --stdin` creates or updates an
+  account and stores the Java-compatible hash; the value is never printed. With
+  no explicit name it uses `ADMIN_USERNAME`, the sole existing account, then
+  `jproxy`.
+- `admin reset-password --stdin` resets the sole existing account and refuses
+  an empty or ambiguous user table. This is the supported path for a migrated
+  `inscripoem` account.
+- `config get|set|list` reads and writes `system_config`. Secret values
+  (`sonarrApikey`, `radarrApikey`, `tmdbApikey`, `qbittorrentPassword`,
+  `transmissionPassword`) are masked unless `--reveal` is passed. `set`
+  accepts `--stdin` or `--file` and only whitelisted keys.
+- `sync --kind sonarr|radarr|tmdb|rules|all` runs one pass, bypassing the
+  daemon `SYNC_ENABLED`/`SYNC_INTERVAL` gates.
+- `doctor` checks the database, invalid non-empty config rows, format tokens,
+  the clean-title regex, and configured upstream reachability. It prints key
+  names and statuses only and exits non-zero on problems.
+- `version` prints the crate version.
+
+### Pagination
+
+- `current` or `pageSize` below 1, and non-numeric values, return HTTP 400.
+- A valid page beyond the end returns HTTP 200 with the requested
+  `current`/`pageSize`, the real `total`, and an empty `list`, for both filtered
+  and unfiltered queries. It never resets to page one.
+- The Java filtered example path can throw `IndexOutOfBoundsException` from
+  `subList`; this service returns the empty page instead (deliberate safety
+  deviation). MyBatis-Plus `overflow: true` page-one restart is also not
+  reproduced.
+- `pageSize` above 1000 is capped, matching the MyBatis limit.
+
+### Timeouts
+
+- `PROBE_CONNECT_TIMEOUT_SECS` (default 6) and `PROBE_READ_TIMEOUT_SECS`
+  (default 12) configure the live configuration probe client.
+- `DOWNLOADER_REQUEST_TIMEOUT_SECS` (default 30) configures qBittorrent and
+  Transmission login/rename calls. Downloader clients no longer share the
+  indexer request timeout.
+- Zero, negative, and non-numeric values are rejected at startup. Retry and
+  backoff for indexer requests remain bounded.
+
+### Version
+
+- `/api/system/config/version` reports `CARGO_PKG_VERSION` (`0.1.0`) instead of
+  the hard-coded Java `3.4.7`.
+- `VERSION_CHECK_URL` defaults to
+  `https://api.github.com/repos/inscripoem/jproxy-rs/releases/latest`. A
+  missing release (404), failed request, timeout, or unparseable response
+  returns the local version. No repository or release was created for this
+  phase.
+
+### Verification
+
+- `nix develop --command cargo fmt --check`: pass.
+- `nix develop --command cargo clippy --all-targets -- -D warnings`: pass.
+- `nix develop --command cargo test`: **165 passed, 0 failed** — 89 unit, 22
+  admin, 9 CLI, 5 downloader, 10 parity, 3 real-data, 7 rename, 14 sync, 6
+  upstream-error. New coverage: first-run seed and explicit/environment
+  override, existing-user preservation, CLI admin/config/sync/doctor behavior,
+  secret masking, malformed page parameters, out-of-range pages across rule/
+  title/TMDB/example endpoints, timeout parsing, probe read timeout, and the
+  own-repo version endpoint.
+- `nix develop --command cargo build --release`: pass; binary 9.1 MB.
+
+### Remaining deviations
+
+- The Charon downloader proxy routes (`/sonarr|radarr/qbittorrent|transmission`)
+  remain unimplemented; they are inactive in the current Java build (no Charon
+  dependency or route configuration).
+- No live A/B of admin login/CRUD, CLI commands, pagination, or timeouts was
+  performed against the Java service or the NAS database. Verification used
+  the in-process router, temporary SQLite databases, child-process CLI runs,
+  and local mock upstreams.
+- The page-one overflow restart and the `subList` exception are intentionally
+  not reproduced, as documented above.
+- Java's Caffeine cache internals remain out of scope.

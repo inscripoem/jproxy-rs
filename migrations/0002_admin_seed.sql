@@ -1,16 +1,11 @@
 -- First-run rows matching the Java Liquibase changelog.
 --
--- The default account is the publicly documented upstream account
--- `jproxy` / `jproxy@2023`. The stored value is MD5(MD5(password)) because the
--- compiled admin UI hashes the password client-side before POSTing it and the
--- Java service hashes the submitted value again. These are public defaults,
--- not operator secrets. The inserts are keyed by username/key rather than by
--- id, so an existing jproxy database keeps its configured values and the
--- baseline keys are added even if its ids were assigned differently.
-
-INSERT INTO system_user (username, password, role)
-SELECT 'jproxy', '765EB35667C4323E7CCB88C94C223202', 'admin'
-WHERE NOT EXISTS (SELECT 1 FROM system_user WHERE username = 'jproxy');
+-- The admin user is seeded by `db::seed_first_run_admin` instead of SQL: the
+-- default account is `jproxy` / `jproxy@2023`, but `ADMIN_USERNAME` and
+-- `ADMIN_PASSWORD` may override it, and an existing `system_user` table is
+-- never modified. The stored value is MD5(MD5(password)) because the compiled
+-- admin UI hashes the password client-side before POSTing it and the Java
+-- service hashes the submitted value again.
 
 WITH defaults("key", value, valid_status) AS (
     VALUES

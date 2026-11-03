@@ -44,9 +44,14 @@ pub struct Prober {
 
 impl Prober {
     pub fn new() -> Result<Self> {
+        Self::with_timeouts(CONNECT_TIMEOUT, READ_TIMEOUT)
+    }
+
+    /// Build a probe client with explicit Java-compatible timeouts.
+    pub fn with_timeouts(connect: Duration, read: Duration) -> Result<Self> {
         let client = Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(READ_TIMEOUT)
+            .connect_timeout(connect)
+            .timeout(read)
             .user_agent(concat!("jproxy-rs/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("build configuration probe client")?;
@@ -197,6 +202,25 @@ mod tests {
         assert!(check_radarr_indexer_format(Some("{title} {year}")));
         assert!(!check_radarr_indexer_format(Some("{title}")));
         assert!(!check_radarr_indexer_format(None));
+    }
+
+    #[tokio::test]
+    async fn probe_read_timeout_bounds_a_stalled_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                drop(stream);
+            }
+        });
+
+        let prober =
+            Prober::with_timeouts(Duration::from_secs(1), Duration::from_millis(100)).unwrap();
+        assert!(
+            !prober.check_url(Some(&format!("http://{addr}"))).await,
+            "a stalled response must hit the read timeout"
+        );
     }
 
     #[test]

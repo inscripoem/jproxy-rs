@@ -76,7 +76,9 @@ the gate pass.
     formatting against recorded Torznab XML.
   - `tests/sync.rs` — title, TMDB, rule, and on-demand synchronization.
   - `tests/admin.rs` — admin CRUD, login/JWT rejection, cache/config
-    endpoints, static UI serving.
+    endpoints, pagination, static UI serving.
+  - `tests/cli.rs` — `admin`, `config`, `sync`, `doctor`, and `version`
+    subcommands against temporary databases and local mocks.
   - `tests/downloaders.rs` — qBittorrent/Transmission sessions and errors.
   - `tests/rename.rs` — Sonarr/Radarr history rename flows.
   - `tests/upstream_errors.rs` — retry, concurrency, and downstream status
@@ -139,8 +141,11 @@ gitignored. Never force-add them.
 
 ## Architecture map
 
-- `src/main.rs` — binary entry point, startup, shutdown, and the `import`
-  subcommand.
+- `src/main.rs` — binary entry point, startup, shutdown, `import`, and
+  subcommand dispatch.
+- `src/cli.rs` — `admin`, `config`, `sync`, `doctor`, and `version`
+  subcommands. They open the SQLite database directly and never start the
+  server.
 - `src/app.rs` — Axum router, shared `AppState`, proxy flow, health, static UI
   fallback, and upstream request orchestration.
 - `src/admin.rs` — Java-compatible admin REST handlers, config validation, and
@@ -174,7 +179,8 @@ gitignored. Never force-add them.
 - Supporting modules: `src/formatting.rs` (item title formatting),
   `src/text.rs` (Java `FormatUtil` ports), `src/models.rs` (shared types).
 - `migrations/` — Java-compatible schema (`0001_schema.sql`) and first-run
-  admin seed (`0002_admin_seed.sql`).
+  `system_config` seed (`0002_admin_seed.sql`). The first-run admin row is
+  inserted by `db::seed_first_run_admin` only when `system_user` is empty.
 - `admin_dist/` — compiled upstream admin UI and MIT license, served read-only
   from disk.
 
@@ -195,28 +201,58 @@ gitignored. Never force-add them.
   not panic.
 - `SYNC_ENABLED` defaults to `true`; `SYNC_INTERVAL=0` also disables
   background and on-demand title sync (it does not gate rule sync).
-  `LOGIN_ENABLED` defaults to `false`; admin API calls still require a bearer
-  token, which login returns as an Anonymous JWT when login is disabled.
-  Relevant timeouts: `REQUEST_TIMEOUT_SECS=30`,
-  `ONDEMAND_SYNC_TIMEOUT_SECS=30`, and `TOKEN_EXPIRES=10080` minutes.
+  `LOGIN_ENABLED` defaults to `true`, matching Java's production default; admin
+  API calls require a bearer token, which login returns as an Anonymous JWT
+  only when login is explicitly disabled. Relevant timeouts:
+  `REQUEST_TIMEOUT_SECS=30`, `ONDEMAND_SYNC_TIMEOUT_SECS=30`,
+  `PROBE_CONNECT_TIMEOUT_SECS=6`, `PROBE_READ_TIMEOUT_SECS=12`,
+  `DOWNLOADER_REQUEST_TIMEOUT_SECS=30`, and `TOKEN_EXPIRES=10080` minutes.
 - Never log, print, echo, or commit API keys, passwords, password values or
   hashes, cookies, session ids, bearer tokens, `Authorization` headers, or real
   `system_config` values. Tests and fixtures must use synthetic values.
 - `/api/system/config/update` performs live probes against the submitted URLs.
   Do not point it at production services, the NAS, or a real downloader in
   tests or casual runs.
+- `/api/system/config/version` reports `CARGO_PKG_VERSION` and checks
+  `VERSION_CHECK_URL`, which defaults to
+  `https://api.github.com/repos/inscripoem/jproxy-rs/releases/latest`. A
+  missing release or failed request returns the local version. Do not create
+  releases or point the check at the Java repository.
 - Do not put real credentials in `.env`, test code, fixtures, or shell history.
   Prefer an operator-exported environment variable passed directly to a
   command.
 
-### Open decision: default admin credentials (TBD)
+### Default admin credentials (decided)
 
-The first-run admin seed exists in `migrations/0002_admin_seed.sql` and follows
-the upstream Java behavior. The policy for that default account is still under
-discussion: keep it, force a credential change on first login, or disable it by
-default. This is **TBD**. Do not change the seed, the stored hash, the login
-flow, or the documented policy without an explicit decision, and record the
-decision in `PARITY_REPORT.md` when it is made.
+- A fresh database with no `system_user` rows receives `jproxy` /
+  `jproxy@2023`, enabled, matching Java. `ADMIN_USERNAME` and `ADMIN_PASSWORD`
+  override the defaults for that first row only.
+- The stored value is uppercase `MD5(MD5(password))`, matching the Java
+  UI-plus-service double hash.
+- Existing `system_user` rows are preserved exactly. Never overwrite, rename,
+  reset, or duplicate a migrated account; the live Java database uses
+  `inscripoem`, not `jproxy`.
+- There is no setup wizard, setup token, secret file, or forced first-login
+  change.
+- The admin UI/API require login by default and stay LAN-accessible. The
+  Torznab routes and `/health` remain public.
+- Startup logs one warning when the default credential is still stored and the
+  service binds to a non-loopback address. Never log the password, hash, or
+  environment value.
+- Operator recovery uses `jproxy-rs admin set-password --stdin` or
+  `admin reset-password --stdin`; both open the database directly. See
+  `README.md` for the full CLI.
+
+### Pagination and CLI invariants
+
+- Malformed `current`/`pageSize` values (zero, negative, non-numeric) return
+  HTTP 400.
+- A valid out-of-range page returns HTTP 200 with the requested coordinates,
+  the real total, and an empty list. Do not reintroduce the MyBatis page-one
+  restart or Java's `subList` exception.
+- CLI subcommands must never start the HTTP server, must read `DATABASE_PATH`
+  directly, must exit non-zero on failure, and must mask secret
+  `system_config` values unless `--reveal` is passed.
 
 ## Git and scope
 

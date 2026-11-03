@@ -58,8 +58,13 @@ Implemented:
   routes. The Torznab routes and `/health` remain public.
 - The compiled Vue admin UI from the Java project, served from `admin_dist/`
   with SPA fallback and MIT attribution.
-- First-run `system_user` and `system_config` rows matching the upstream
-  Liquibase seed (`jproxy` / `jproxy@2023` through the UI).
+- First-run `system_config` rows matching the upstream Liquibase seed and a
+  first-run `system_user` row. A fresh database gets `jproxy` / `jproxy@2023`
+  when neither `ADMIN_USERNAME` nor `ADMIN_PASSWORD` overrides it. An existing
+  `system_user` table is never modified, so a migrated Java account such as
+  `inscripoem` is preserved exactly.
+- Operator CLI (`admin`, `config`, `sync`, `doctor`, `version`) that opens the
+  configured SQLite database directly and works through `docker exec` or SSH.
 - Multi-stage Dockerfile.
 - Reference-data import from an existing `jproxy.db` (`jproxy-rs import`).
 - End-to-end parity harness against recorded Torznab XML fixtures.
@@ -101,8 +106,10 @@ The test suite includes:
 - `tests/sync.rs` — title, TMDB, rule and on-demand synchronization against
   local mock Sonarr/Radarr/TMDB/rule endpoints;
 - `tests/upstream_errors.rs` — retry, concurrency and error-mapping tests;
-- `tests/admin.rs` — admin CRUD, login/JWT rejection, cache/config endpoints and
-  static UI serving with synthetic users only;
+- `tests/admin.rs` — admin CRUD, login/JWT rejection, pagination, cache/config
+  endpoints and static UI serving with synthetic users only;
+- `tests/cli.rs` — `admin`, `config`, `sync`, `doctor`, and `version` against
+  temporary databases and a local mock upstream;
 - `tests/real_data.rs` — validation against data exported from a live jproxy.
 
 The release profile sets `opt-level = "z"`, thin LTO, one codegen unit and
@@ -122,10 +129,18 @@ export SYNC_ENABLED=false
 target/release/jproxy-rs
 ```
 
-The service creates missing tables and the upstream first-run seed rows on
-startup. It does not copy an operator's users, API keys, or configured values:
-the seed uses `INSERT OR IGNORE`, so an imported database is preserved. At
-runtime it reads only the whitelisted baseline keys described under
+The service creates missing tables and the upstream first-run rows on startup.
+An empty `system_user` table gets `jproxy` / `jproxy@2023` unless
+`ADMIN_USERNAME`/`ADMIN_PASSWORD` override the defaults. An imported database
+keeps every existing user row, including a migrated account whose username is
+not `jproxy`; the seed never resets or overwrites it. `LOGIN_ENABLED` defaults
+to `true`, so the admin UI and API require login while the Torznab routes and
+`/health` stay public. When the default credential is still stored and
+`LISTEN_ADDR` is not a loopback address, startup logs one warning that the
+default admin credential should be changed before public exposure; the warning
+contains no username, password, or hash.
+
+At runtime the service reads only the whitelisted keys described under
 Configuration and verifies admin logins against `system_user`; downloader
 credentials are held in memory and never logged.
 
@@ -149,6 +164,50 @@ Health:
 curl -fsS http://127.0.0.1:8117/health
 {"status":"ok","version":"0.1.0","database":"ok","result_cache_entries":0}
 ```
+
+## Agent and operator CLI
+
+The same binary provides subcommands for hosts without the admin UI. They open
+`DATABASE_PATH` directly and do not start the HTTP server, so they work through
+`docker exec` or SSH, including while the service is stopped. Every failure is
+reported on stderr and exits non-zero.
+
+```sh
+# Create jproxy or update any existing account. The value is read from stdin
+# and stored as MD5(MD5(password)); it is never printed.
+printf '%s\n' "$ADMIN_PASSWORD" | jproxy-rs admin set-password --stdin
+printf '%s\n' "$ADMIN_PASSWORD" | jproxy-rs admin set-password --username inscripoem --stdin
+
+# Reset the only existing account; fails when the table is empty or ambiguous.
+printf '%s\n' "$ADMIN_PASSWORD" | jproxy-rs admin reset-password --stdin
+
+# system_config access. Credential values are masked unless --reveal is passed.
+jproxy-rs config list
+jproxy-rs config get sonarrUrl
+jproxy-rs config get sonarrApikey --reveal
+printf '%s\n' "$VALUE" | jproxy-rs config set sonarrApikey --stdin
+jproxy-rs config set cleanTitleRegex --file ./clean-title-regex.txt
+
+# One synchronization pass. SYNC_ENABLED/SYNC_INTERVAL gates are bypassed for
+# an explicit manual run; missing Sonarr/Radarr/TMDB configuration is reported
+# as "skipped".
+jproxy-rs sync --kind sonarr
+jproxy-rs sync --kind all
+
+# Database, config validity, and configured upstream reachability. Prints key
+# names and statuses only, never values.
+jproxy-rs doctor
+jproxy-rs version
+```
+
+`admin set-password` with no `--username` uses `ADMIN_USERNAME`, then the sole
+existing account, then `jproxy`. This means a migrated database containing only
+`inscripoem` is updated in place rather than gaining a second administrator.
+`admin reset-password` updates the sole existing account, which is how a
+migrated database with only `inscripoem` is reset. `config set` accepts only the
+whitelisted `system_config` keys listed under Configuration and marks the row
+valid. `config get`/`list` mask `sonarrApikey`, `radarrApikey`, `tmdbApikey`,
+`qbittorrentPassword`, and `transmissionPassword`.
 
 ## Real data import
 
@@ -272,11 +331,16 @@ All other settings remain environment-only.
 | `SONARR_RENAME_FALLBACK_MINS` | `30` | Sonarr history lookback window in minutes. |
 | `RADARR_RENAME_FALLBACK_MINS` | `30` | Radarr history lookback window in minutes. |
 | `RENAME_FILE` | `true` | Also rename files inside a qBittorrent torrent after the torrent rename succeeds. Transmission has no file-level rename. |
-| `LOGIN_ENABLED` | `false` | Require credentials for `/api/**` admin routes. When false, `/api/system/user/login` returns an Anonymous JWT; the UI still needs that token for admin calls. |
+| `LOGIN_ENABLED` | `true` | Require credentials for `/api/**` admin routes, matching Java's production default. When false, `/api/system/user/login` returns an Anonymous JWT; the UI still needs that token for admin calls. |
 | `TOKEN_EXPIRES` | `10080` | Admin JWT lifetime in minutes (seven days). |
+| `ADMIN_USERNAME` | `jproxy` | Username for the first-run admin row only. Ignored when `system_user` is non-empty. |
+| `ADMIN_PASSWORD` | `jproxy@2023` | Plaintext password for the first-run admin row only, stored as uppercase MD5 of its MD5. Ignored when `system_user` is non-empty. Never logged. |
 | `ADMIN_UI_DIR` | `admin_dist` | Directory containing the compiled admin UI (`index.html` and `assets/`). Missing files return 404; it is never fetched at runtime. |
-| `VERSION_CHECK_URL` | Java GitHub `releases/latest` endpoint | Release endpoint used by `/api/system/config/version`; override points tests at a local mock. |
+| `VERSION_CHECK_URL` | `https://api.github.com/repos/inscripoem/jproxy-rs/releases/latest` | Release endpoint used by `/api/system/config/version`; override points tests at a local mock. |
 | `REQUEST_TIMEOUT_SECS` | `30` | Upstream and sync HTTP timeout. |
+| `PROBE_CONNECT_TIMEOUT_SECS` | `6` | Connect timeout for live configuration probes (`/api/system/config/update`, `doctor`). |
+| `PROBE_READ_TIMEOUT_SECS` | `12` | Whole-request timeout for live configuration probes. |
+| `DOWNLOADER_REQUEST_TIMEOUT_SECS` | `30` | Timeout for qBittorrent and Transmission login, rename, and file calls. |
 | `RESULT_CACHE_MAX_ENTRIES` | `1000` | Maximum cached Torznab responses. |
 | `UPSTREAM_MAX_CONCURRENCY` | `8` | Maximum simultaneous upstream indexer requests. |
 | `UPSTREAM_MAX_RETRIES` | `2` | Retries for 408/429/5xx and transport failures. |
@@ -315,23 +379,34 @@ Authentication follows the Java controller and interceptor:
   `/api/system/user/login` and `/api/system/user/isLoginEnabled`; missing or
   invalid tokens return `403`. The Torznab proxy routes and `/health` stay
   public.
-- `LOGIN_ENABLED=false` makes `login` return an Anonymous JWT; user `update`
+- `LOGIN_ENABLED` defaults to `true`, matching Java's production configuration.
+  With `LOGIN_ENABLED=false`, `login` returns an Anonymous JWT; user `update`
   then returns `401`. The UI still needs the token for admin calls.
-- The first-run seed creates `jproxy` / `jproxy@2023`, matching the upstream
-  documentation. The compiled UI sends the uppercase MD5 of the typed password,
-  and the service hashes the submitted value once. Direct API clients must
-  therefore POST the uppercase MD5, not the plaintext. For a synthetic password
-  `synthetic-password`, that value is the uppercase MD5 of
-  `synthetic-password`.
+- First-run admin policy:
+  - A database with no `system_user` rows gets `jproxy` / `jproxy@2023`,
+    enabled, matching Java. `ADMIN_USERNAME` and `ADMIN_PASSWORD` override
+    those defaults and are ignored when any user already exists.
+  - The stored value is the uppercase MD5 of the uppercase MD5 of the typed
+    password, the format Java uses when the compiled UI hashes the value before
+    POSTing it. Direct API clients must POST the uppercase MD5 of the typed
+    password, not the plaintext.
+  - Existing `system_user` rows are preserved exactly. A migrated Java database
+    whose account is `inscripoem` is never renamed, reset, or duplicated.
+  - There is no setup wizard, setup token, secret file, or forced first-login
+    change.
+  - If the default credential is still stored and the service is bound to a
+    non-loopback address, startup logs one warning that it should be changed
+    before public exposure. The warning never contains the password or hash.
 - JWTs are HS256 with a random per-process secret. Claims are `id`, `username`,
   `password`, `role`, `valid_status`, `exp`, and `iat`; `TOKEN_EXPIRES`
   (minutes) controls expiry. Tokens become invalid after a process restart.
   Logout blacklists the raw `Authorization` header. More than ten wrong logins
   block login until restart, as in Java.
 - `/api/system/config/update` reproduces Java's live validation:
-  - Sonarr/Radarr: `GET {url}/api/v3/health?apikey=...` with 6 s connect and
-    12 s read timeouts. A 401 or an `Unauthorized` body marks only the URL
-    valid; a connection failure marks both invalid.
+  - Sonarr/Radarr: `GET {url}/api/v3/health?apikey=...` with
+    `PROBE_CONNECT_TIMEOUT_SECS` (default 6) and `PROBE_READ_TIMEOUT_SECS`
+    (default 12). A 401 or an `Unauthorized` body marks only the URL valid; a
+    connection failure marks both invalid.
   - Indexer formats: Sonarr requires `{title}`, `{season}`, `{episode}`;
     Radarr requires `{title}`, `{year}`.
   - qBittorrent and Transmission: check the URL, normalize the Transmission
@@ -345,16 +420,21 @@ Authentication follows the Java controller and interceptor:
   The rows are persisted with Java's upsert semantics, then the shared
   configuration snapshot and dependent caches are refreshed immediately.
   URLs, API keys, usernames, passwords, and tokens are never logged.
-- `/api/system/config/version` queries the Java GitHub `releases/latest`
-  endpoint with a bounded timeout, strips `v` from `tag_name`, compares it with
-  this package's version, and appends ` 🚨` on a mismatch. Any failure returns
-  the local version. Tests point `VERSION_CHECK_URL` at a local mock.
+- `/api/system/config/version` queries
+  `https://api.github.com/repos/inscripoem/jproxy-rs/releases/latest` (override
+  with `VERSION_CHECK_URL`) with a bounded timeout, strips one leading `v` from
+  `tag_name`, compares it with this crate's `CARGO_PKG_VERSION` (`0.1.0`), and
+  appends ` 🚨` on a mismatch. A missing release, non-success status, timeout,
+  or parse failure returns the local version unchanged.
 - `/api/system/config/query` runs one Sonarr rename pass before returning the
   rows, matching the Java controller.
-- Example pagination follows MyBatis-Plus `overflow: true` for unfiltered
-  queries. The Java `validStatus` path can throw `subList` when the requested
-  page is past the filtered end; this service returns an empty page instead
-  (documented deviation).
+- Pagination is strict and non-destructive:
+  - `current`/`pageSize` below 1, or non-numeric values, return HTTP 400.
+  - A valid page beyond the end returns HTTP 200 with the requested
+    `current`/`pageSize`, the real `total`, and an empty `list`, for both
+    filtered and unfiltered queries. It never resets to page one and never
+    reproduces Java's `subList` exception.
+  - `pageSize` above 1000 is capped, matching the MyBatis limit.
 
 ## Background schedule
 
@@ -615,9 +695,12 @@ cache and allocator retention included.
 
 The bundled `sqlx` SQLite build uses its own SQLite library. The schema in
 `migrations/0001_schema.sql` mirrors the final upstream Liquibase migrations,
-including the later `series_id` and `movie_id` columns. `migrations/0002_admin_seed.sql`
-adds the upstream first-run `system_user` and `system_config` rows with
-`INSERT OR IGNORE`, so an imported database keeps its own users and settings.
+including the later `series_id` and `movie_id` columns.
+`migrations/0002_admin_seed.sql` adds the upstream first-run `system_config`
+rows with `INSERT OR IGNORE`. The first-run admin user is inserted separately,
+only when `system_user` is empty, so an existing account (for example
+`inscripoem` in a migrated Java database) is never overwritten and the default
+`jproxy` account is not added alongside it.
 There is no Liquibase metadata table in this project, so an existing `jproxy.db`
 can be opened directly, but run it against a backup first. The service reads
 only the whitelisted `system_config` keys and verifies admin logins against
@@ -750,14 +833,26 @@ mechanism rather than committing them.
   use new values without restart. Java achieves the same through its
   `SYSTEM_CONFIG` cache. Rows marked `INVALID` fail strict reads; callers skip
   or degrade rather than panicking.
-- **Admin version check.** `/api/system/config/version` calls the same GitHub
-  `releases/latest` endpoint as Java, with a bounded timeout. It compares the
-  tag with this package's `0.1.0`, so the ` 🚨` marker normally appears when a
-  Java release exists. `VERSION_CHECK_URL` exists so tests use a local mock.
-- **Example pagination edge.** Unfiltered example queries use MyBatis-Plus
-  `overflow: true` semantics. Java's filtered `validStatus` path can throw
-  `IndexOutOfBoundsException` from `subList` for a page past the filtered end;
-  this service returns an empty page instead.
+- **Admin version check.** `/api/system/config/version` calls this project's
+  GitHub `releases/latest` endpoint
+  (`inscripoem/jproxy-rs`), with a bounded timeout. It compares the tag with
+  `CARGO_PKG_VERSION` (`0.1.0`). A repository with no release, a failed request,
+  or an unparseable response returns the local version without the marker.
+  `VERSION_CHECK_URL` exists so tests use a local mock.
+- **Admin credential policy.** A fresh database receives the documented Java
+  default `jproxy` / `jproxy@2023`, or the `ADMIN_USERNAME`/`ADMIN_PASSWORD`
+  pair when provided. Existing users are never modified, and there is no setup
+  wizard, setup token, or forced first-login change. Startup warns once when
+  the default hash is still stored and the listener is non-loopback.
+- **Pagination edge.** A valid page beyond the end returns HTTP 200 with the
+  requested coordinates and an empty list. Malformed `current`/`pageSize`
+  values return HTTP 400. Java's MyBatis path restarts some pages at one and
+  its filtered example path can throw `IndexOutOfBoundsException` from
+  `subList`; both behaviours are deliberately not reproduced.
+- **Bounded timeouts.** Probe timeouts are `PROBE_CONNECT_TIMEOUT_SECS` (6) and
+  `PROBE_READ_TIMEOUT_SECS` (12); downloader calls use
+  `DOWNLOADER_REQUEST_TIMEOUT_SECS` (30). Java's RestTemplate can wait far
+  longer. Retry/backoff for indexer requests remains bounded.
 - **Admin UI delivery.** The compiled UI is vendored from the Java distribution
   (MIT, see `admin_dist/LICENSE.txt`) and served from disk; it is not rebuilt or
   downloaded at runtime. Unknown `/api/**` paths require authentication and
@@ -773,6 +868,7 @@ src/app.rs          Axum routes, proxy flow, health, static UI fallback
 src/admin.rs        Java-compatible admin REST handlers and validation
 src/admin_db.rs     admin SQLite queries and page types
 src/auth.rs         MD5 password contract, HS256 JWT, blacklist, middleware
+src/cli.rs          admin/config/sync/doctor/version subcommands
 src/search.rs       alternate-title plan and MIN_COUNT retry executor
 src/rules.rs        priority-ordered compiled rules
 src/formatting.rs   Java-compatible item title formatting
@@ -788,9 +884,9 @@ src/sync.rs         Sonarr/Radarr title sync, TMDB sync, rule sync, on-demand
 src/upstream.rs     reqwest/rustls upstream client, retry and concurrency
 src/query.rs        lossless-enough query parameter editing and cache keys
 src/text.rs         Java FormatUtil ports
-migrations/         Java-compatible SQLite schema and first-run admin seed
+migrations/         Java-compatible SQLite schema and first-run config seed
 admin_dist/         compiled Java admin UI with MIT license
 fixtures/           exported reference DB and synthetic Torznab XML
-tests/              parity, sync, downloader, rename, admin and upstream-error tests
+tests/              parity, sync, downloader, rename, admin, CLI and error tests
 scripts/            fixture export, local run and Java/Rust comparison
 ```

@@ -45,14 +45,48 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await
         .context("initialize SQLite schema")?;
-    // Matches the Java Liquibase first-run rows. The seed is keyed by
-    // username/config key, so an imported upstream database is never
-    // overwritten and its own user/settings are preserved.
+    // Matches the Java Liquibase first-run rows. The seed is keyed by config
+    // key, so an imported upstream database is never overwritten.
     sqlx::raw_sql(ADMIN_SEED)
         .execute(pool)
         .await
         .context("initialize admin seed rows")?;
+    let (username, password) = crate::auth::first_run_admin_credentials(
+        std::env::var("ADMIN_USERNAME").ok(),
+        std::env::var("ADMIN_PASSWORD").ok(),
+    );
+    seed_first_run_admin(pool, &username, &password).await?;
     Ok(())
+}
+
+/// Create the admin user only when `system_user` is empty.
+///
+/// An imported Java database keeps every existing row, including a migrated
+/// account whose username is not `jproxy`. The insert is a single conditional
+/// statement so concurrent starts cannot double-insert.
+pub async fn seed_first_run_admin(pool: &SqlitePool, username: &str, password: &str) -> Result<()> {
+    let hash = crate::auth::stored_password_hash(password);
+    sqlx::query(
+        "INSERT INTO system_user (username, password, role, valid_status) \
+         SELECT ?, ?, 'admin', 1 WHERE NOT EXISTS (SELECT 1 FROM system_user)",
+    )
+    .bind(username)
+    .bind(hash)
+    .execute(pool)
+    .await
+    .context("seed first-run admin user")?;
+    Ok(())
+}
+
+/// Whether any stored account still uses the public default credential.
+/// The hash itself is never logged or returned to a caller outside this check.
+pub async fn uses_default_admin_password(pool: &SqlitePool) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM system_user WHERE password = ?")
+        .bind(crate::auth::DEFAULT_PASSWORD_HASH)
+        .fetch_one(pool)
+        .await
+        .context("check for the default admin credential")?;
+    Ok(count > 0)
 }
 
 pub async fn healthcheck(pool: &SqlitePool) -> Result<()> {
@@ -354,6 +388,63 @@ mod tests {
 
     fn regex() -> Regex {
         Regex::new(crate::config::DEFAULT_CLEAN_TITLE_REGEX).unwrap()
+    }
+
+    #[tokio::test]
+    async fn first_run_admin_is_seeded_once_and_never_replaces_existing_users() {
+        let pool = connect_memory().await.unwrap();
+        let (username, hash): (String, String) =
+            sqlx::query_as("SELECT username, password FROM system_user")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(username, crate::auth::DEFAULT_USERNAME);
+        assert_eq!(hash, crate::auth::DEFAULT_PASSWORD_HASH);
+
+        // An explicit first-run override stores the same Java-compatible hash.
+        sqlx::query("DELETE FROM system_user")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_first_run_admin(&pool, "operator", "synthetic-password")
+            .await
+            .unwrap();
+        let (username, hash): (String, String) =
+            sqlx::query_as("SELECT username, password FROM system_user")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(username, "operator");
+        assert_eq!(
+            hash,
+            crate::auth::stored_password_hash("synthetic-password")
+        );
+
+        // A migrated account keeps its username and stored hash exactly.
+        sqlx::query("DELETE FROM system_user")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO system_user (username, password, role, valid_status) \
+             VALUES ('inscripoem', 'MIGRATED-HASH-VALUE', 'admin', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_first_run_admin(&pool, "jproxy", "jproxy@2023")
+            .await
+            .unwrap();
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT username, password FROM system_user")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![("inscripoem".to_owned(), "MIGRATED-HASH-VALUE".to_owned())]
+        );
+        assert!(!uses_default_admin_password(&pool).await.unwrap());
     }
 
     #[tokio::test]

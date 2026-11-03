@@ -478,6 +478,19 @@ impl Downloaders {
         }
     }
 
+    /// Build downloader clients with a bounded request timeout.
+    ///
+    /// Java's RestTemplate waits far longer than a rename task should; this
+    /// keeps login and rename calls bounded by `DOWNLOADER_REQUEST_TIMEOUT_SECS`.
+    pub fn with_timeout(timeout: std::time::Duration) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .timeout(timeout)
+            .user_agent(concat!("jproxy-rs/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("build downloader HTTP client")?;
+        Ok(Self::new(client))
+    }
+
     pub async fn any_logged_in(&self) -> bool {
         self.qbittorrent.is_login().await || self.transmission.is_login().await
     }

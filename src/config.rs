@@ -26,6 +26,11 @@ pub const DEFAULT_RULE_LOCATION_BACKUP: &str =
 pub const DEFAULT_SONARR_LANGUAGE_1: &str = "zh-CN";
 pub const DEFAULT_SONARR_LANGUAGE_2: &str = "zh-TW";
 pub const DEFAULT_RULE_SYNC_AUTHORS: &str = "ALL";
+pub const DEFAULT_VERSION_CHECK_URL: &str =
+    "https://api.github.com/repos/inscripoem/jproxy-rs/releases/latest";
+pub const DEFAULT_PROBE_CONNECT_TIMEOUT_SECS: u64 = 6;
+pub const DEFAULT_PROBE_READ_TIMEOUT_SECS: u64 = 12;
+pub const DEFAULT_DOWNLOADER_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// The `system_config` keys this service is allowed to read.
 ///
@@ -266,6 +271,13 @@ pub struct Config {
     pub sync_enabled: bool,
     pub request_timeout: Duration,
     pub on_demand_sync_timeout: Duration,
+    /// Java `CheckUtil` connect timeout for configuration probes.
+    pub probe_connect_timeout: Duration,
+    /// Java `CheckUtil` read timeout for configuration probes.
+    pub probe_read_timeout: Duration,
+    /// Timeout for qBittorrent/Transmission requests. Java's RestTemplate
+    /// default is unbounded in practice; this stays deliberately bounded.
+    pub downloader_request_timeout: Duration,
     pub result_cache_max_entries: usize,
     pub cache_max_entries: usize,
     /// Maximum simultaneous in-flight upstream indexer requests.
@@ -337,16 +349,27 @@ impl Config {
             token_expires: Duration::from_secs(
                 env_minutes("TOKEN_EXPIRES", 10080)?.saturating_mul(60),
             ),
-            version_check_url: env_string("VERSION_CHECK_URL").unwrap_or_else(|| {
-                "https://api.github.com/repos/LuckyPuppy514/jproxy/releases/latest".to_owned()
-            }),
+            version_check_url: env_string("VERSION_CHECK_URL")
+                .unwrap_or_else(|| DEFAULT_VERSION_CHECK_URL.to_owned()),
             admin_ui_dir: env_string("ADMIN_UI_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("admin_dist")),
-            login_enabled: env_bool("LOGIN_ENABLED", false)?,
+            login_enabled: env_bool("LOGIN_ENABLED", true)?,
             sync_enabled,
             request_timeout: Duration::from_secs(env_u64("REQUEST_TIMEOUT_SECS", 30)?),
             on_demand_sync_timeout: Duration::from_secs(env_u64("ONDEMAND_SYNC_TIMEOUT_SECS", 30)?),
+            probe_connect_timeout: env_timeout_secs(
+                "PROBE_CONNECT_TIMEOUT_SECS",
+                DEFAULT_PROBE_CONNECT_TIMEOUT_SECS,
+            )?,
+            probe_read_timeout: env_timeout_secs(
+                "PROBE_READ_TIMEOUT_SECS",
+                DEFAULT_PROBE_READ_TIMEOUT_SECS,
+            )?,
+            downloader_request_timeout: env_timeout_secs(
+                "DOWNLOADER_REQUEST_TIMEOUT_SECS",
+                DEFAULT_DOWNLOADER_REQUEST_TIMEOUT_SECS,
+            )?,
             result_cache_max_entries: env_usize("RESULT_CACHE_MAX_ENTRIES", 1000)?,
             cache_max_entries: env_usize("CACHE_MAX_ENTRIES", 1000)?,
             upstream_max_concurrency: env_usize("UPSTREAM_MAX_CONCURRENCY", 8)?.max(1),
@@ -574,6 +597,31 @@ impl Config {
     }
 }
 
+/// `DATABASE_PATH` with the same default the server uses. CLI subcommands use
+/// this instead of resolving the whole environment, so an unrelated invalid
+/// setting cannot stop `admin`, `config`, or `doctor`.
+pub fn database_path_from_env() -> PathBuf {
+    std::env::var("DATABASE_PATH")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./jproxy.db"))
+}
+
+/// Whether a `system_config` value is a credential that CLI output must mask
+/// unless the operator explicitly passes `--reveal`.
+pub fn is_secret_system_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        "sonarrApikey"
+            | "radarrApikey"
+            | "tmdbApikey"
+            | "qbittorrentPassword"
+            | "transmissionPassword"
+    )
+}
+
 /// Environment variable for a whitelisted key. Used to keep precedence exact
 /// even when an environment value happens to equal the built-in default.
 fn environment_override_present(key: &str) -> bool {
@@ -675,6 +723,26 @@ fn env_minutes(name: &str, default: u64) -> Result<u64> {
     env_u64(name, default)
 }
 
+/// Parse a whole-second timeout. Rejects values that cannot be a non-negative
+/// integer and rejects zero, which would make every request fail immediately.
+fn env_timeout_secs(name: &str, default: u64) -> Result<Duration> {
+    parse_timeout_secs(name, env_string(name).as_deref(), default)
+}
+
+fn parse_timeout_secs(name: &str, value: Option<&str>, default: u64) -> Result<Duration> {
+    let seconds = match value {
+        Some(value) => value
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be a positive integer number of seconds"))?,
+        None => default,
+    };
+    if seconds == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +787,9 @@ mod tests {
             sync_enabled: true,
             request_timeout: Duration::from_secs(5),
             on_demand_sync_timeout: Duration::from_secs(5),
+            probe_connect_timeout: Duration::from_secs(6),
+            probe_read_timeout: Duration::from_secs(12),
+            downloader_request_timeout: Duration::from_secs(30),
             result_cache_max_entries: 100,
             cache_max_entries: 100,
             upstream_max_concurrency: 8,
@@ -731,6 +802,45 @@ mod tests {
             key: key.to_owned(),
             value: Some(value.to_owned()),
             valid_status,
+        }
+    }
+
+    #[test]
+    fn timeout_parsing_accepts_positive_seconds_and_rejects_bad_values() {
+        assert_eq!(
+            parse_timeout_secs("PROBE_READ_TIMEOUT_SECS", None, 12).unwrap(),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            parse_timeout_secs("PROBE_READ_TIMEOUT_SECS", Some("7"), 12).unwrap(),
+            Duration::from_secs(7)
+        );
+        for value in ["0", "-1", "abc", "1.5", ""] {
+            assert!(
+                parse_timeout_secs("PROBE_READ_TIMEOUT_SECS", Some(value), 12).is_err(),
+                "{value:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_keys_are_the_only_masked_config_values() {
+        for key in [
+            "sonarrApikey",
+            "radarrApikey",
+            "tmdbApikey",
+            "qbittorrentPassword",
+            "transmissionPassword",
+        ] {
+            assert!(is_secret_system_config_key(key), "{key} must be masked");
+        }
+        for key in [
+            "sonarrUrl",
+            "tmdbUrl",
+            "qbittorrentUsername",
+            "ruleSyncAuthors",
+        ] {
+            assert!(!is_secret_system_config_key(key), "{key} is not secret");
         }
     }
 

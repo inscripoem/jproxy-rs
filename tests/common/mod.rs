@@ -547,7 +547,7 @@ impl TestEnv {
             rename_file: false,
             token_expires: Duration::from_secs(10080 * 60),
             version_check_url: format!(
-                "{}/repos/LuckyPuppy514/jproxy/releases/latest",
+                "{}/repos/inscripoem/jproxy-rs/releases/latest",
                 self.mock.base_url()
             ),
             admin_ui_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("admin_dist"),
@@ -555,6 +555,9 @@ impl TestEnv {
             sync_enabled: false,
             request_timeout: Duration::from_secs(5),
             on_demand_sync_timeout: Duration::from_secs(5),
+            probe_connect_timeout: Duration::from_secs(2),
+            probe_read_timeout: Duration::from_secs(2),
+            downloader_request_timeout: Duration::from_secs(5),
             result_cache_max_entries: 100,
             cache_max_entries: 100,
             upstream_max_concurrency: 8,

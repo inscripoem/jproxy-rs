@@ -345,6 +345,9 @@ async fn radarr_rule_query(
 }
 
 async fn rule_query(state: &AppState, kind: AppKind, query: &RuleQuery) -> Response {
+    if let Err(problem) = query.validate() {
+        return bad_request(problem);
+    }
     match admin_db::query_rules(&state.pool, kind, query).await {
         Ok(page) => Json(page).into_response(),
         Err(error) => internal_error("query rules", error),
@@ -631,6 +634,9 @@ async fn sonarr_title_query(
     State(state): State<AppState>,
     Query(query): Query<SonarrTitleQuery>,
 ) -> Response {
+    if let Err(problem) = query.validate() {
+        return bad_request(problem);
+    }
     match admin_db::query_sonarr_titles(&state.pool, &query).await {
         Ok(page) => Json(page).into_response(),
         Err(error) => internal_error("query Sonarr titles", error),
@@ -641,6 +647,9 @@ async fn radarr_title_query(
     State(state): State<AppState>,
     Query(query): Query<RadarrTitleQuery>,
 ) -> Response {
+    if let Err(problem) = query.validate() {
+        return bad_request(problem);
+    }
     match admin_db::query_radarr_titles(&state.pool, &query).await {
         Ok(page) => Json(page).into_response(),
         Err(error) => internal_error("query Radarr titles", error),
@@ -739,6 +748,9 @@ async fn example_query(
     headers: &HeaderMap,
     query: &ExampleQuery,
 ) -> Response {
+    if let Err(problem) = query.validate() {
+        return bad_request(problem);
+    }
     let (current, page_size, offset) = query.bounds();
     let mut examples = if query.valid_status.is_none() {
         match admin_db::query_examples_page(
@@ -750,18 +762,14 @@ async fn example_query(
         )
         .await
         {
-            Ok((total, used_offset, rows)) => {
+            Ok((total, rows)) => {
                 let rows = match format_examples(state, kind, headers, rows).await {
                     Ok(rows) => rows,
                     Err(error) => return internal_error("format examples", error),
                 };
-                // MyBatis-Plus runs with `overflow: true`, so a page past the
-                // end restarts at page one.
-                let current = if total > 0 && used_offset != offset {
-                    1
-                } else {
-                    current
-                };
+                // A page beyond the end stays on the requested page and
+                // returns an empty list; Java's MyBatis path would restart at
+                // page one.
                 return Json(Page {
                     current,
                     page_size,
@@ -931,6 +939,9 @@ async fn tmdb_title_query(
     State(state): State<AppState>,
     Query(query): Query<TmdbTitleQuery>,
 ) -> Response {
+    if let Err(problem) = query.validate() {
+        return bad_request(problem);
+    }
     let page = match admin_db::query_tmdb_titles(&state.pool, &query).await {
         Ok(page) => page,
         Err(error) => return internal_error("query TMDB titles", error),
@@ -998,9 +1009,8 @@ async fn tmdb_title_save(
 // ---------------------------------------------------------------------------
 
 async fn system_config_version(State(state): State<AppState>) -> Response {
-    // Match the Java Maven project.version being replaced (pom.xml 3.4.7).
-    const JAVA_COMPAT_VERSION: &str = "3.4.7";
-    let local = JAVA_COMPAT_VERSION;
+    // Compare against this crate's version, not the Java release it replaces.
+    let local = env!("CARGO_PKG_VERSION");
     let url = state.snapshot().version_check_url.clone();
     match latest_release_version(&state, &url).await {
         Some(latest) if latest != local => text(StatusCode::OK, format!("{local} 🚨")),
@@ -1024,7 +1034,7 @@ async fn latest_release_version(state: &AppState, url: &str) -> Option<String> {
                 Ok(payload) => payload
                     .get("tag_name")
                     .and_then(Value::as_str)
-                    .map(|tag| tag.replace('v', "")),
+                    .map(|tag| tag.strip_prefix('v').unwrap_or(tag).to_owned()),
                 Err(error) => {
                     tracing::debug!(
                         error = %error.without_url(),

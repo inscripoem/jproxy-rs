@@ -46,9 +46,22 @@ where
     }
 }
 
+/// Reject malformed page coordinates instead of silently normalizing them.
+///
+/// `current` and `pageSize` must be at least one. Values above `MAX_PAGE_SIZE`
+/// keep the Java/MyBatis cap rather than failing.
+fn validate_page(current: i64, page_size: i64) -> std::result::Result<(), String> {
+    if current < 1 {
+        return Err("current: must be greater than or equal to 1".to_owned());
+    }
+    if page_size < 1 {
+        return Err("pageSize: must be greater than or equal to 1".to_owned());
+    }
+    Ok(())
+}
+
 fn page_bounds(current: i64, page_size: i64) -> (i64, i64, i64) {
-    let current = current.max(1);
-    let page_size = page_size.clamp(1, MAX_PAGE_SIZE);
+    let page_size = page_size.min(MAX_PAGE_SIZE);
     let offset = (current - 1).saturating_mul(page_size);
     (current, page_size, offset)
 }
@@ -70,6 +83,10 @@ impl RuleQuery {
     pub fn bounds(&self) -> (i64, i64, i64) {
         page_bounds(self.current, self.page_size)
     }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        validate_page(self.current, self.page_size)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +105,10 @@ pub struct SonarrTitleQuery {
 impl SonarrTitleQuery {
     pub fn bounds(&self) -> (i64, i64, i64) {
         page_bounds(self.current, self.page_size)
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        validate_page(self.current, self.page_size)
     }
 }
 
@@ -108,6 +129,10 @@ impl RadarrTitleQuery {
     pub fn bounds(&self) -> (i64, i64, i64) {
         page_bounds(self.current, self.page_size)
     }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        validate_page(self.current, self.page_size)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +152,10 @@ impl ExampleQuery {
     pub fn bounds(&self) -> (i64, i64, i64) {
         page_bounds(self.current, self.page_size)
     }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        validate_page(self.current, self.page_size)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,6 +174,10 @@ pub struct TmdbTitleQuery {
 impl TmdbTitleQuery {
     pub fn bounds(&self) -> (i64, i64, i64) {
         page_bounds(self.current, self.page_size)
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        validate_page(self.current, self.page_size)
     }
 }
 
@@ -381,13 +414,11 @@ pub async fn query_rules(
     }
     let total: i64 = count_query.fetch_one(pool).await?.try_get("count")?;
 
-    let (mut current, page_size, mut offset) = query.bounds();
-    // MyBatis-Plus `overflow: true` restarts at page one when the requested
-    // page is past the end.
-    if total > 0 && offset >= total {
-        current = 1;
-        offset = 0;
-    }
+    let (current, page_size, offset) = query.bounds();
+    // A page beyond the end is a valid request: SQLite returns an empty list
+    // with the requested coordinates and the real total. Java's MyBatis
+    // `overflow: true` would restart at page one, and its manual example path
+    // could throw from `subList`; both are intentional deviations.
 
     let list_sql = format!(
         "SELECT id, token, priority, regex, replacement, offset, example, remark, author, \
@@ -638,11 +669,8 @@ pub async fn query_sonarr_titles(
     }
     let total: i64 = count_query.fetch_one(pool).await?.try_get("count")?;
 
-    let (mut current, page_size, mut offset) = query.bounds();
-    if total > 0 && offset >= total {
-        current = 1;
-        offset = 0;
-    }
+    let (current, page_size, offset) = query.bounds();
+    // Out-of-range pages stay on the requested page and return an empty list.
 
     let list_sql = format!(
         "SELECT id, series_id, tvdb_id, sno, main_title, title, clean_title, season_number, \
@@ -696,11 +724,8 @@ pub async fn query_radarr_titles(
     }
     let total: i64 = count_query.fetch_one(pool).await?.try_get("count")?;
 
-    let (mut current, page_size, mut offset) = query.bounds();
-    if total > 0 && offset >= total {
-        current = 1;
-        offset = 0;
-    }
+    let (current, page_size, offset) = query.bounds();
+    // Out-of-range pages stay on the requested page and return an empty list.
 
     let list_sql = format!(
         "SELECT id, movie_id, tmdb_id, sno, main_title, title, clean_title, year, monitored, \
@@ -760,9 +785,9 @@ pub async fn query_examples_page(
     pool: &SqlitePool,
     kind: AppKind,
     original_text: &Option<String>,
-    mut offset: i64,
+    offset: i64,
     limit: i64,
-) -> Result<(i64, i64, Vec<ExampleRecord>)> {
+) -> Result<(i64, Vec<ExampleRecord>)> {
     let table = table(kind, "example");
     let original = like(original_text);
     let where_sql = if original.is_some() {
@@ -778,12 +803,8 @@ pub async fn query_examples_page(
     }
     let total: i64 = count_query.fetch_one(pool).await?.try_get("count")?;
 
-    // MyBatis-Plus runs with `overflow: true`: a page past the end restarts at
-    // page one, including its offset.
-    if total > 0 && offset >= total {
-        offset = 0;
-    }
-
+    // MyBatis-Plus `overflow: true` would restart a page past the end at page
+    // one. This service keeps the requested offset and returns an empty list.
     let list_sql = format!(
         "SELECT hash, original_text, format_text, valid_status, create_time, update_time \
          FROM {table}{where_sql} ORDER BY update_time DESC LIMIT ? OFFSET ?"
@@ -797,7 +818,7 @@ pub async fn query_examples_page(
         .iter()
         .map(example_from_row)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((total, offset, list))
+    Ok((total, list))
 }
 
 pub async fn query_examples_all(
@@ -898,11 +919,8 @@ pub async fn query_tmdb_titles(
     }
     let total: i64 = count_query.fetch_one(pool).await?.try_get("count")?;
 
-    let (mut current, page_size, mut offset) = query.bounds();
-    if total > 0 && offset >= total {
-        current = 1;
-        offset = 0;
-    }
+    let (current, page_size, offset) = query.bounds();
+    // Out-of-range pages stay on the requested page and return an empty list.
 
     let list_sql = format!(
         "SELECT id, tvdb_id, tmdb_id, language, title, valid_status, create_time, update_time \
@@ -1008,6 +1026,104 @@ pub async fn query_system_config(pool: &SqlitePool) -> Result<Vec<SystemConfigRe
             })
         })
         .collect()
+}
+
+pub async fn get_system_config(pool: &SqlitePool, key: &str) -> Result<Option<SystemConfigRecord>> {
+    let row = sqlx::query(
+        "SELECT id, \"key\", value, valid_status, create_time, update_time \
+         FROM system_config WHERE \"key\" = ? ORDER BY id LIMIT 1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        Ok::<_, sqlx::Error>(SystemConfigRecord {
+            id: row.try_get("id")?,
+            key: row.try_get("key")?,
+            value: row.try_get("value")?,
+            valid_status: row.try_get("valid_status")?,
+            create_time: row.try_get("create_time")?,
+            update_time: row.try_get("update_time")?,
+        })
+    })
+    .transpose()
+    .map_err(Into::into)
+}
+
+/// Upsert one `system_config` value by key, marking the row valid.
+pub async fn set_system_config_value(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE system_config SET value = ?, valid_status = 1, \
+         update_time = DATETIME(CURRENT_TIMESTAMP, 'localtime') WHERE \"key\" = ?",
+    )
+    .bind(value)
+    .bind(key)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        sqlx::query("INSERT INTO system_config (\"key\", value, valid_status) VALUES (?, ?, 1)")
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Create or update an admin user's stored password hash.
+pub async fn set_user_password(pool: &SqlitePool, username: &str, hash: &str) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE system_user SET password = ?, \
+         update_time = DATETIME(CURRENT_TIMESTAMP, 'localtime') WHERE username = ?",
+    )
+    .bind(hash)
+    .bind(username)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        sqlx::query(
+            "INSERT INTO system_user (username, password, role, valid_status) \
+             VALUES (?, ?, 'admin', 1)",
+        )
+        .bind(username)
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Usernames ordered by id, used by the CLI to resolve a default target.
+pub async fn list_usernames(pool: &SqlitePool) -> Result<Vec<String>> {
+    sqlx::query_scalar("SELECT username FROM system_user ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .map_err(Into::into)
+}
+
+/// Reset the stored hash of the only existing admin account.
+///
+/// Returns the username so the CLI can confirm the target without printing a
+/// credential. Ambiguous or empty user tables are explicit errors.
+pub async fn reset_single_user_password(pool: &SqlitePool, hash: &str) -> Result<String> {
+    let users = list_usernames(pool).await?;
+    match users.as_slice() {
+        [] => bail!("no admin user exists; use `admin set-password --stdin` to create one"),
+        [username] => {
+            sqlx::query(
+                "UPDATE system_user SET password = ?, \
+                 update_time = DATETIME(CURRENT_TIMESTAMP, 'localtime') WHERE username = ?",
+            )
+            .bind(hash)
+            .bind(username)
+            .execute(pool)
+            .await?;
+            Ok(username.clone())
+        }
+        _ => {
+            bail!("multiple admin users exist; use `admin set-password --username <name> --stdin`")
+        }
+    }
 }
 
 pub async fn update_system_config(pool: &SqlitePool, configs: &[SystemConfigRecord]) -> Result<()> {

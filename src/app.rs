@@ -73,7 +73,7 @@ impl AppState {
             snapshot.upstream_retry,
             snapshot.upstream_max_concurrency,
         )?;
-        let downloaders = Downloaders::new(upstream.http_client().clone());
+        let downloaders = Downloaders::with_timeout(snapshot.downloader_request_timeout)?;
         let result_cache = Arc::new(TtlCache::with_expiry(
             snapshot.indexer_result_cache_expires,
             snapshot.result_cache_max_entries,
@@ -98,7 +98,10 @@ impl AppState {
             pool,
             upstream,
             downloaders,
-            prober: Prober::new()?,
+            prober: Prober::with_timeouts(
+                snapshot.probe_connect_timeout,
+                snapshot.probe_read_timeout,
+            )?,
             result_cache,
             formatting_cache,
             title_cache,
@@ -218,6 +221,26 @@ impl AppState {
     pub async fn clear_reference_caches(&self) {
         self.formatting_cache.clear().await;
         self.title_cache.clear().await;
+    }
+
+    /// Warn once at startup when the public default admin credential is still
+    /// stored and the listener is reachable from outside this host.
+    ///
+    /// The warning deliberately contains no username, password, or hash.
+    pub async fn warn_if_default_admin_credentials(&self) {
+        if self.snapshot().listen_addr.ip().is_loopback() {
+            return;
+        }
+        match db::uses_default_admin_password(&self.pool).await {
+            Ok(true) => tracing::warn!(
+                "default admin credential is still in use; change it before exposing this \
+                 service outside the local machine"
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::debug!(%error, "could not check for the default admin credential");
+            }
+        }
     }
 }
 

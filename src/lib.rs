@@ -3,6 +3,7 @@ pub mod admin_db;
 pub mod app;
 pub mod auth;
 pub mod cache;
+pub mod cli;
 pub mod config;
 pub mod db;
 pub mod downloader;

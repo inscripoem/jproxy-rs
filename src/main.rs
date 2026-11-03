@@ -18,11 +18,20 @@ async fn main() -> Result<()> {
     if args.get(1).map(String::as_str) == Some("import") {
         return run_import(&args[2..]).await;
     }
+    if let Some(subcommand) = args.get(1).map(String::as_str)
+        && matches!(
+            subcommand,
+            "admin" | "config" | "sync" | "doctor" | "version"
+        )
+    {
+        return jproxy_rs::cli::run(&args[1..]).await;
+    }
 
     let config = Config::from_env()?;
     info!("starting jproxy-rs {}", env!("CARGO_PKG_VERSION"));
 
     let state = AppState::new(config).await?;
+    state.warn_if_default_admin_credentials().await;
     let snapshot = state.snapshot();
     info!("{}", snapshot.startup_summary());
     sync::spawn(state.clone());

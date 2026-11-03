@@ -792,29 +792,35 @@ async fn system_config_update_probes_endpoints_and_applies_immediately() {
 #[tokio::test]
 async fn version_endpoint_compares_the_github_release_tag() {
     let env = TestEnv::start().await;
-    let release_path = "/repos/LuckyPuppy514/jproxy/releases/latest";
+    let release_path = "/repos/inscripoem/jproxy-rs/releases/latest";
     env.mock.route_path(
         release_path,
-        common::MockResponse::json(r#"{"tag_name":"v3.4.7"}"#),
+        common::MockResponse::json(r#"{"tag_name":"v0.1.0"}"#),
     );
     let router = env.router_with(auth_config(&env, false)).await;
     let token = login(&router, "Anonymous", "Anonymous").await.body;
 
     let version = get_auth(&router, "/api/system/config/version", &token).await;
     assert_eq!(version.status, 200);
-    assert_eq!(version.body, "3.4.7");
+    assert_eq!(version.body, "0.1.0");
 
     env.mock.route_path(
         release_path,
         common::MockResponse::json(r#"{"tag_name":"v9.9.9"}"#),
     );
     let version = get_auth(&router, "/api/system/config/version", &token).await;
-    assert_eq!(version.body, "3.4.7 🚨");
+    assert_eq!(version.body, "0.1.0 🚨");
 
     env.mock
         .route_path(release_path, common::MockResponse::status(500));
     let version = get_auth(&router, "/api/system/config/version", &token).await;
-    assert_eq!(version.body, "3.4.7");
+    assert_eq!(version.body, "0.1.0");
+
+    // A repository without a release returns 404; the local version is used.
+    env.mock
+        .route_path(release_path, common::MockResponse::status(404));
+    let version = get_auth(&router, "/api/system/config/version", &token).await;
+    assert_eq!(version.body, "0.1.0");
 }
 
 #[tokio::test]
@@ -918,20 +924,21 @@ async fn example_pagination_handles_pages_past_the_end() {
     let router = env.router_with(auth_config(&env, false)).await;
     let token = login(&router, "Anonymous", "Anonymous").await.body;
 
-    // Unfiltered MyBatis-Plus pagination resets an out-of-range page to one.
+    // A page past the end stays on the requested page with an empty list.
     let page = get_auth(
         &router,
         "/api/sonarr/example/query?current=5&pageSize=10",
         &token,
     )
     .await;
+    assert_eq!(page.status, 200);
     let page: Value = serde_json::from_str(&page.body).unwrap();
-    assert_eq!(page["current"], 1);
+    assert_eq!(page["current"], 5);
     assert_eq!(page["total"], 2);
-    assert_eq!(page["list"].as_array().unwrap().len(), 2);
+    assert!(page["list"].as_array().unwrap().is_empty());
 
-    // Java's manual validStatus path could throw `subList` here. This service
-    // intentionally returns an empty page instead.
+    // The Java `validStatus` path could throw `subList` here. This service
+    // returns an empty page with the requested coordinates instead.
     let page = get_auth(
         &router,
         "/api/sonarr/example/query?current=2&pageSize=10&validStatus=0",
@@ -943,6 +950,65 @@ async fn example_pagination_handles_pages_past_the_end() {
     assert_eq!(page["current"], 2);
     assert_eq!(page["total"], 0);
     assert!(page["list"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn pagination_rejects_malformed_parameters_and_keeps_out_of_range_pages() {
+    let env = TestEnv::start().await;
+    env.exec(
+        "INSERT INTO sonarr_title (id, tvdb_id, sno, main_title, title, clean_title, \
+         season_number, monitored) VALUES \
+         (1, 100, 0, 'Main Show', 'Main Show', 'main show', -1, 1); \
+         INSERT INTO sonarr_rule (id, token, priority, regex, replacement, offset, example, \
+         remark, author, valid_status) VALUES \
+         ('title-rule', 'title', 900, '.*', 'x', 0, 'example', 'remark', 'author', 1); \
+         INSERT INTO tmdb_title (id, tvdb_id, tmdb_id, language, title) VALUES \
+         (1, 100, 200, 'zh-CN', '主标题'); \
+         INSERT INTO sonarr_example (hash, original_text, valid_status) VALUES \
+         ('h1', 'Main Show S01E01', 1), ('h2', 'Main Show S02E02', 1); \
+         INSERT INTO radarr_title (id, tmdb_id, sno, main_title, title, clean_title, year, \
+         monitored) VALUES (1, 200, 0, 'Main Movie', 'Main Movie', 'main movie', 2020, 1)",
+    )
+    .await;
+    let router = env.router_with(auth_config(&env, false)).await;
+    let token = login(&router, "Anonymous", "Anonymous").await.body;
+
+    let resources = [
+        "/api/sonarr/rule/query",
+        "/api/sonarr/title/query?title=Main",
+        "/api/radarr/title/query?title=Main",
+        "/api/tmdb/title/query",
+        "/api/sonarr/example/query?validStatus=1",
+    ];
+    for resource in resources {
+        for suffix in [
+            "current=0",
+            "current=-1",
+            "pageSize=0",
+            "pageSize=-5",
+            "current=abc",
+            "pageSize=abc",
+        ] {
+            let separator = if resource.contains('?') { '&' } else { '?' };
+            let response =
+                get_auth(&router, &format!("{resource}{separator}{suffix}"), &token).await;
+            assert_eq!(response.status, 400, "{resource} {suffix}");
+        }
+
+        // A valid page beyond the end keeps its coordinates and is empty.
+        let separator = if resource.contains('?') { '&' } else { '?' };
+        let response = get_auth(
+            &router,
+            &format!("{resource}{separator}current=9&pageSize=10"),
+            &token,
+        )
+        .await;
+        assert_eq!(response.status, 200, "{resource}");
+        let page: Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(page["current"], 9, "{resource}");
+        assert!(page["list"].as_array().unwrap().is_empty(), "{resource}");
+        assert!(page["total"].as_i64().is_some(), "{resource}");
+    }
 }
 
 #[tokio::test]
