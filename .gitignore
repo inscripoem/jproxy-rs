@@ -17,3 +17,14 @@ result-*
 fixtures/*.db-wal
 fixtures/*.db-shm
 fixtures/*.db-journal
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# pre-commit
+.pre-commit-config.yaml
+
+# Upstream admin UI checkout used by scripts/build-admin-ui.sh
+.work/

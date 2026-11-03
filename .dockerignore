@@ -1,6 +1,12 @@
 target
 .git
 .direnv
+.devenv*
+.work
+admin-ui
+devenv.local.nix
+devenv.local.yaml
+node_modules
 *.db
 *.db-journal
 *.db-wal

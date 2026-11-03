@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+  # Pinned only for the Node/pnpm versions used to build the vendored admin UI.
+  # nixos-24.05 still ships pnpm 8, which reads the upstream 5.4 lockfile
+  # without the dependency drift that pnpm 9+ introduces.
+  nixpkgs-ui:
+    url: github:NixOS/nixpkgs/nixos-24.05

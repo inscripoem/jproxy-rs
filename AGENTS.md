@@ -28,10 +28,11 @@ file, follow the operator.
 - The Java reference source is external, not vendored. Use the checkout at
   `/tmp/jproxy-src.KSddZV` when present, otherwise the upstream GitHub
   repository. Do not copy Java source into this tree.
-- `admin_dist/` contains the compiled upstream Vue admin UI copied from the
-  Java distribution under the MIT license (`admin_dist/LICENSE.txt`). Treat it
-  as read-only vendored output: do not edit, reformat, or regenerate it unless
-  explicitly asked.
+- `admin_dist/` contains the compiled admin UI rebuilt from the MIT-licensed
+  upstream Vue source (`LuckyPuppy514/jproxy-admin`, pinned in
+  `admin-ui/README.md`) with the jproxy-rs branding patch. Do not hand-edit
+  generated assets; run `scripts/build-admin-ui.sh` to regenerate them. Keep
+  `admin_dist/LICENSE.txt` and `admin_dist/NOTICE`.
 
 ## Toolchain
 
@@ -52,12 +53,22 @@ nix develop --command cargo build --release
   tool that must come from the shell, including `sqlite3`.
 - The release binary is `target/release/jproxy-rs`.
 
+Admin UI commands must run inside `devenv`, not the Rust flake. The build
+script re-enters it automatically; for ad-hoc commands use:
+
+```sh
+devenv shell -- pnpm install --shamefully-hoist
+devenv shell -- pnpm build
+```
+
 ## Verification gate
 
-A task is not done until all four commands above pass from a clean state, with
-no `error:` output and no warnings. `cargo clippy` must include
-`--all-targets -- -D warnings`; do not drop the flag or suppress lints to make
-the gate pass.
+A task is not done until the Rust verification commands above pass from a
+clean state, with no `error:` output and no warnings. `cargo clippy` must
+include `--all-targets -- -D warnings`; do not drop the flag or suppress
+lints to make the gate pass. For admin UI changes, also run
+`scripts/build-admin-ui.sh` and confirm `admin_dist/index.html` and its
+hashed assets are consistent.
 
 - Run focused tests while iterating, then the full suite before declaring done.
 - Do not delete tests, mark them ignored, or weaken assertions to pass.

@@ -1,0 +1,112 @@
+diff --git a/index.html b/index.html
+index 8e46733..2b13387 100644
+--- a/index.html
++++ b/index.html
+@@ -5,7 +5,7 @@
+   <meta charset="UTF-8" />
+   <link rel="shortcut icon" type="image/x-icon" href="/src/assets/favicon.ico">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+-  <title>JProxy Admin</title>
++  <title>jproxy-rs Admin</title>
+ </head>
+ 
+ <body>
+diff --git a/src/components/footer/index.vue b/src/components/footer/index.vue
+index 9871186..176bc2e 100644
+--- a/src/components/footer/index.vue
++++ b/src/components/footer/index.vue
+@@ -1,7 +1,11 @@
+ <template>
+   <a-layout-footer class="footer">
++    <a-link href="https://github.com/inscripoem/jproxy-rs" target="_blank">
++      jproxy-rs
++    </a-link>
++    <span class="footer-text">· UI based on</span>
+     <a-link href="https://github.com/LuckyPuppy514/jproxy" target="_blank">
+-      © 2023 LuckyPuppy514
++      JProxy © 2023 LuckyPuppy514
+     </a-link>
+     <icon-star-fill
+       :spin="true"
+@@ -34,6 +38,9 @@
+     margin: 5px;
+     color: var(--color-text-2);
+   }
++  .footer-text {
++    margin: 0 2px;
++  }
+   .footer a:hover {
+     color: rgb(var(--primary-6));
+     background-color: rgba(0, 0, 0, 0);
+diff --git a/src/components/navbar/index.vue b/src/components/navbar/index.vue
+index 8a6742f..a79ae3f 100644
+--- a/src/components/navbar/index.vue
++++ b/src/components/navbar/index.vue
+@@ -16,7 +16,7 @@
+           }"
+           :heading="5"
+         >
+-          JProxy
++          jproxy-rs
+         </a-typography-title>
+         <a-link
+           style="margin-top: 15px; font-size: 13px; color: var(--color-text-1)"
+diff --git a/src/views/login/components/login-form.vue b/src/views/login/components/login-form.vue
+index d40eb2f..0f4ddaa 100644
+--- a/src/views/login/components/login-form.vue
++++ b/src/views/login/components/login-form.vue
+@@ -54,6 +54,7 @@
+         </a-button>
+       </a-space>
+     </a-form>
++    <div class="login-form-disclaimer">{{ $t('login.disclaimer') }}</div>
+   </div>
+ </template>
+ 
+@@ -204,4 +205,10 @@
+   .login-form-title {
+     padding: 20px;
+   }
++  .login-form-disclaimer {
++    margin-top: 16px;
++    color: var(--color-text-3);
++    font-size: 12px;
++    line-height: 18px;
++  }
+ </style>
+diff --git a/src/views/login/locale/en-US.ts b/src/views/login/locale/en-US.ts
+index 6f2e2f2..07e6990 100644
+--- a/src/views/login/locale/en-US.ts
++++ b/src/views/login/locale/en-US.ts
+@@ -1,5 +1,5 @@
+ export default {
+-  'login.title': 'JProxy Admin',
++  'login.title': 'jproxy-rs Admin',
+   'login.username.error': 'Username can not be empty',
+   'login.password.error': 'Password can not be empty',
+   'login.username.placeholder': 'Please input username',
+@@ -15,4 +15,6 @@ export default {
+   'login.banner.slogan3': 'qBittorrent',
+   'login.banner.subSlogan3': 'Title Format, Reduce Import Error',
+   'login.forbidden': 'Login has expired, please relogin',
++  'login.disclaimer':
++    'Unofficial Rust rewrite of JProxy. Not affiliated with LuckyPuppy514 or the upstream JProxy project.',
+ };
+diff --git a/src/views/login/locale/zh-CN.ts b/src/views/login/locale/zh-CN.ts
+index 639c4ae..89914e0 100644
+--- a/src/views/login/locale/zh-CN.ts
++++ b/src/views/login/locale/zh-CN.ts
+@@ -1,5 +1,5 @@
+ export default {
+-  'login.title': 'JProxy Admin',
++  'login.title': 'jproxy-rs 管理后台',
+   'login.username.error': '用户名不能为空',
+   'login.password.error': '密码不能为空',
+   'login.username.placeholder': '请输入用户名',
+@@ -15,4 +15,6 @@ export default {
+   'login.banner.slogan3': 'qBittorrent',
+   'login.banner.subSlogan3': '标题格式化处理，减少导入错误',
+   'login.forbidden': '登录已过期，请重新登录',
++  'login.disclaimer':
++    'JProxy 的非官方 Rust 重写，与 LuckyPuppy514 及上游 JProxy 项目无关。',
+ };

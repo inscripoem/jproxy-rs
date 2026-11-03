@@ -439,8 +439,10 @@ kind. A missing Prowlarr/Jackett URL makes the related routes return HTTP 503.
 
 ## Admin UI, API and authentication
 
-The compiled Vue admin UI from the MIT-licensed Java project is vendored in
-`admin_dist/` together with `admin_dist/LICENSE.txt`. It is served from disk at
+The Vue admin UI in `admin_dist/` is rebuilt from the MIT-licensed upstream
+`LuckyPuppy514/jproxy-admin` source with a small branding patch; see
+`admin-ui/README.md` and `scripts/build-admin-ui.sh`. It ships together with
+`admin_dist/LICENSE.txt` and `admin_dist/NOTICE` and is served from disk at
 `/` with SPA fallback for client-side routes. `ADMIN_UI_DIR` selects the
 directory; the UI is never downloaded at runtime. Unknown `/api/**` paths,
 `/health`, and the Torznab proxy prefixes never fall through to the SPA.
@@ -966,10 +968,12 @@ The `latest` tag is mutable. Compose does not pull it in the background; with
   `PROBE_READ_TIMEOUT_SECS` (12); downloader calls use
   `DOWNLOADER_REQUEST_TIMEOUT_SECS` (30). Java's RestTemplate can wait far
   longer. Retry/backoff for indexer requests remains bounded.
-- **Admin UI delivery.** The compiled UI is vendored from the Java distribution
-  (MIT, see `admin_dist/LICENSE.txt`) and served from disk; it is not rebuilt or
-  downloaded at runtime. Unknown `/api/**` paths require authentication and
-  return `403` without a token, then `404`, matching the Java interceptor.
+- **Admin UI delivery.** The UI is rebuilt from the pinned upstream Vue
+  source (MIT, see `admin_dist/LICENSE.txt`, `admin_dist/NOTICE` and
+  `admin-ui/README.md`) by `scripts/build-admin-ui.sh`, then vendored and
+  served from disk. It is not downloaded at runtime. Unknown `/api/**` paths
+  require authentication and return `403` without a token, then `404`,
+  matching the Java interceptor.
 - **Charon downloader routes.** Java v3.1.0 (commit `d3480bd`, 2023-04-11)
   removed the Charon reverse proxy and replaced it with direct qBittorrent
   rename. The current Java build has no Charon dependency or route
@@ -1003,7 +1007,7 @@ src/upstream.rs     reqwest/rustls upstream client, retry and concurrency
 src/query.rs        lossless-enough query parameter editing and cache keys
 src/text.rs         Java FormatUtil ports
 migrations/         Java-compatible SQLite schema and first-run config seed
-admin_dist/         compiled Java admin UI with MIT license
+admin_dist/         compiled admin UI rebuilt from the upstream Vue source
 fixtures/           exported reference DB and synthetic Torznab XML
 tests/              parity, sync, downloader, rename, admin, CLI and error tests
 scripts/            fixture export, local run and Java/Rust comparison
@@ -1011,5 +1015,6 @@ scripts/            fixture export, local run and Java/Rust comparison
 
 ## License
 
-MIT. The vendored admin UI under `admin_dist/` comes from the upstream Java
-project and carries its own MIT license in `admin_dist/LICENSE.txt`.
+MIT. The admin UI under `admin_dist/` is derived from the upstream
+`LuckyPuppy514/jproxy-admin` project and carries its MIT license in
+`admin_dist/LICENSE.txt`.
