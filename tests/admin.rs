@@ -795,26 +795,26 @@ async fn version_endpoint_compares_the_github_release_tag() {
     let release_path = "/repos/LuckyPuppy514/jproxy/releases/latest";
     env.mock.route_path(
         release_path,
-        common::MockResponse::json(r#"{"tag_name":"v0.1.0"}"#),
+        common::MockResponse::json(r#"{"tag_name":"v3.4.7"}"#),
     );
     let router = env.router_with(auth_config(&env, false)).await;
     let token = login(&router, "Anonymous", "Anonymous").await.body;
 
     let version = get_auth(&router, "/api/system/config/version", &token).await;
     assert_eq!(version.status, 200);
-    assert_eq!(version.body, "0.1.0");
+    assert_eq!(version.body, "3.4.7");
 
     env.mock.route_path(
         release_path,
         common::MockResponse::json(r#"{"tag_name":"v9.9.9"}"#),
     );
     let version = get_auth(&router, "/api/system/config/version", &token).await;
-    assert_eq!(version.body, "0.1.0 🚨");
+    assert_eq!(version.body, "3.4.7 🚨");
 
     env.mock
         .route_path(release_path, common::MockResponse::status(500));
     let version = get_auth(&router, "/api/system/config/version", &token).await;
-    assert_eq!(version.body, "0.1.0");
+    assert_eq!(version.body, "3.4.7");
 }
 
 #[tokio::test]

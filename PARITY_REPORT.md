@@ -16,6 +16,8 @@ Extra features on `features/full-parity` (not pushed, not merged):
 
 - `a343ba9` — `jproxy-rs: downloader login and rename parity`.
 - `17c9d1f` — `jproxy-rs: admin ui api auth parity`.
+- `817e37b` — `jproxy-rs: finalize parity report`.
+- `7fa1c1e` — `jproxy-rs: strict java parity fixes`.
 
 Feature worktree: `~/dev/jproxy-rs-features`, branch `features/full-parity`.
 All planned feature phases are implemented and tested; merge awaits review.
@@ -416,9 +418,8 @@ or `/mnt/user` write was used.
 
 ### Remaining deviations
 
-- The GitHub version comparison uses this package's `0.1.0` as the local
-  version, so a live Java release tag normally produces the ` 🚨` marker.
-  Java compares its own Maven project version.
+- The GitHub version comparison uses the Java Maven project version `3.4.7`
+  being replaced, matching the Java build's own comparison.
 - The Java `validStatus` example pagination path returns an empty page instead
   of throwing `subList` (deliberate safety deviation).
 - Java's Caffeine cache internals and the Charon downloader proxy routes remain

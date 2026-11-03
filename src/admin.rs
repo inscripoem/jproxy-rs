@@ -998,7 +998,9 @@ async fn tmdb_title_save(
 // ---------------------------------------------------------------------------
 
 async fn system_config_version(State(state): State<AppState>) -> Response {
-    let local = env!("CARGO_PKG_VERSION");
+    // Match the Java Maven project.version being replaced (pom.xml 3.4.7).
+    const JAVA_COMPAT_VERSION: &str = "3.4.7";
+    let local = JAVA_COMPAT_VERSION;
     let url = state.snapshot().version_check_url.clone();
     match latest_release_version(&state, &url).await {
         Some(latest) if latest != local => text(StatusCode::OK, format!("{local} 🚨")),
