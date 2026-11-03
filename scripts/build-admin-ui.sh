@@ -67,9 +67,9 @@ done
 )
 
 test -f "$SRC_DIR/dist/index.html"
-grep -q '<title>jproxy-rs Admin</title>' "$SRC_DIR/dist/index.html"
+grep -q '<title>JProxy-RS Admin</title>' "$SRC_DIR/dist/index.html"
 
-# Primary navigation must point at jproxy-rs. The upstream attribution link in
+# Primary navigation must point at JProxy-RS. The upstream attribution link in
 # the footer is the only upstream GitHub URL allowed in the generated bundle.
 DIST_FILES=("$SRC_DIR/dist/index.html" "$SRC_DIR"/dist/assets/*.js)
 if grep -q -E 'LuckyPuppy514/jproxy/(issues|blob)' "${DIST_FILES[@]}"; then

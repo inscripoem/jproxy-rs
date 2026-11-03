@@ -1,10 +1,11 @@
 The compiled admin UI in this directory is derived from
 https://github.com/LuckyPuppy514/jproxy-admin
-(MIT License, Copyright (c) 2023 LuckyPuppy514), modified by jproxy-rs.
+(MIT License, Copyright (c) 2023 LuckyPuppy514), modified by JProxy-RS
+(https://github.com/inscripoem/jproxy-rs).
 
 Upstream source commit: 47ed76e943152d831c134144881d99d6b8a9b2bf
 Rebuild: scripts/build-admin-ui.sh
 The upstream license text is preserved in LICENSE.txt.
 
-jproxy-rs is an unofficial Rust rewrite of JProxy. It is not affiliated
+JProxy-RS is an unofficial Rust rewrite of JProxy. It is not affiliated
 with LuckyPuppy514 or the upstream JProxy project.

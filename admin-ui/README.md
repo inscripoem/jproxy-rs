@@ -65,8 +65,8 @@ and `admin_dist/NOTICE` are preserved.
 
 `admin-ui/patches/0001-branding.patch`:
 
-- `<title>` and login titles become `jproxy-rs Admin` / `jproxy-rs 管理后台`.
-- Navbar wordmark becomes `jproxy-rs`; the GitHub, issue and
+- `<title>` and login titles become `JProxy-RS Admin` / `JProxy-RS 管理后台`.
+- Navbar wordmark becomes `JProxy-RS`; the GitHub, issue and
   version/changelog links point to the jproxy-rs repository; layout and logo
   are unchanged.
 - Footer links to the jproxy-rs repository and keeps the upstream

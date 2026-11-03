@@ -1,4 +1,6 @@
-# jproxy-rs
+# JProxy-RS
+
+Repository and package name: `jproxy-rs`.
 
 A Rust implementation of the Phase 1 jproxy proxy between Sonarr/Radarr and
 Prowlarr/Jackett. It forwards Torznab requests, rewrites search queries using

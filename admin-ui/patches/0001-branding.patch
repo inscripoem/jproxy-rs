@@ -7,7 +7,7 @@ index 8e46733..2b13387 100644
    <link rel="shortcut icon" type="image/x-icon" href="/src/assets/favicon.ico">
    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 -  <title>JProxy Admin</title>
-+  <title>jproxy-rs Admin</title>
++  <title>JProxy-RS Admin</title>
  </head>
  
  <body>
@@ -19,7 +19,7 @@ index 9871186..176bc2e 100644
  <template>
    <a-layout-footer class="footer">
 +    <a-link href="https://github.com/inscripoem/jproxy-rs" target="_blank">
-+      jproxy-rs
++      JProxy-RS
 +    </a-link>
 +    <span class="footer-text">· UI based on</span>
      <a-link href="https://github.com/LuckyPuppy514/jproxy" target="_blank">
@@ -47,7 +47,7 @@ index 8a6742f..13f320f 100644
            :heading="5"
          >
 -          JProxy
-+          jproxy-rs
++          JProxy-RS
          </a-typography-title>
          <a-link
            style="margin-top: 15px; font-size: 13px; color: var(--color-text-1)"
@@ -104,7 +104,7 @@ index 6f2e2f2..07e6990 100644
 @@ -1,5 +1,5 @@
  export default {
 -  'login.title': 'JProxy Admin',
-+  'login.title': 'jproxy-rs Admin',
++  'login.title': 'JProxy-RS Admin',
    'login.username.error': 'Username can not be empty',
    'login.password.error': 'Password can not be empty',
    'login.username.placeholder': 'Please input username',
@@ -113,7 +113,7 @@ index 6f2e2f2..07e6990 100644
    'login.banner.subSlogan3': 'Title Format, Reduce Import Error',
    'login.forbidden': 'Login has expired, please relogin',
 +  'login.disclaimer':
-+    'Unofficial Rust rewrite of JProxy. Not affiliated with LuckyPuppy514 or the upstream JProxy project.',
++    'JProxy-RS is an unofficial Rust rewrite of JProxy. Not affiliated with LuckyPuppy514 or the upstream JProxy project.',
  };
 diff --git a/src/views/login/locale/zh-CN.ts b/src/views/login/locale/zh-CN.ts
 index 639c4ae..89914e0 100644
@@ -122,7 +122,7 @@ index 639c4ae..89914e0 100644
 @@ -1,5 +1,5 @@
  export default {
 -  'login.title': 'JProxy Admin',
-+  'login.title': 'jproxy-rs 管理后台',
++  'login.title': 'JProxy-RS 管理后台',
    'login.username.error': '用户名不能为空',
    'login.password.error': '密码不能为空',
    'login.username.placeholder': '请输入用户名',
@@ -131,5 +131,5 @@ index 639c4ae..89914e0 100644
    'login.banner.subSlogan3': '标题格式化处理，减少导入错误',
    'login.forbidden': '登录已过期，请重新登录',
 +  'login.disclaimer':
-+    'JProxy 的非官方 Rust 重写，与 LuckyPuppy514 及上游 JProxy 项目无关。',
++    'JProxy-RS 是 JProxy 的非官方 Rust 重写，与 LuckyPuppy514 及上游 JProxy 项目无关。',
  };
