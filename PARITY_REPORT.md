@@ -2,6 +2,23 @@
 
 Milestone: jproxy-rs 1:1 parity, baseline and extra feature phases.
 
+## Charon downloader routes are not a parity gap
+
+Java v3.1.0 (commit `d3480bd`, 2023-04-11) removed the Charon reverse-proxy
+integration and replaced it with direct qBittorrent rename. The changelog
+states "Remove the proxy of qBittorrent" and "Add qBittorrent rename function,
+support Sonarr and Radarr". The commit deleted the Charon dependency,
+`CharonConfig`, the downloader filters, and the downloader proxy services, and
+added the Sonarr/Radarr rename tasks.
+
+The legacy routes `/sonarr|radarr/qbittorrent|transmission` are therefore not
+part of current Java behavior and return 404 in the current build. Only unused
+`CHARON_*` and downloader filter path constants remain in `Common.java`. This
+implementation calls
+the downloader APIs directly for login and rename, matching the post-v3.1.0
+Java behavior. Not implementing the old proxy is deliberate, not a missing
+feature.
+
 ## Commits
 
 Baseline on `main`:
@@ -291,9 +308,6 @@ Samples were stable within each phase. Values are current `VmRSS`, not peak
 
 ### Remaining gaps
 
-- Charon downloader proxy routes (`/sonarr|radarr/qbittorrent|transmission`).
-  They are also inactive in the current Java build: no Charon dependency and no
-  route configuration, so this is not a working Java endpoint.
 - No live A/B or deployment test of admin login/CRUD against the NAS service.
   Tests use the in-process router, temporary databases, and synthetic users.
 - No live validation probes during config updates, and no config hot reload.
@@ -308,8 +322,6 @@ logged, or committed. All measurements used temporary files outside the NAS.
   performed (see above); the remaining synchronization tests use local mocks and
   synthetic values.
 - Exact Java cron alignment.
-- Downloader API proxying (the Charon routes). They are inactive in the current
-  Java build and remain a follow-up.
 - Live config-update probes and config hot reload.
 - A live deployment check of admin login/CRUD against the NAS service.
 
@@ -317,7 +329,8 @@ logged, or committed. All measurements used temporary files outside the NAS.
 
 1. Accept the admin feature profile (10.2-20.1 MB RSS) and the documented
    deviations?
-2. Schedule the Charon downloader proxy routes as a separate follow-up?
+2. Confirm that the Charon downloader routes need no follow-up because Java
+   v3.1.0 removed them (see the Charon note above)?
 3. Accept syntactic config validation and restart-to-apply as the shipped
    behaviour, or require live probes/hot reload in a later phase?
 
@@ -423,8 +436,9 @@ or `/mnt/user` write was used.
   being replaced, matching the Java build's own comparison.
 - The Java `validStatus` example pagination path returns an empty page instead
   of throwing `subList` (deliberate safety deviation).
-- Java's Caffeine cache internals and the Charon downloader proxy routes remain
-  out of scope; the Charon routes are inactive in the current Java build.
+- Java's Caffeine cache internals remain out of scope. The Charon downloader
+  routes are not a deviation: Java v3.1.0 removed them (see the Charon note
+  above).
 - Probe/login timeouts for the shared downloader clients are bounded by
   `REQUEST_TIMEOUT_SECS` (30 s) rather than Java's 15-minute RestTemplate.
 - No live A/B was performed against a real Sonarr/Radarr/TMDB/downloader or the
@@ -533,9 +547,9 @@ SSH. All failures are explicit and non-zero.
 
 ### Remaining deviations
 
-- The Charon downloader proxy routes (`/sonarr|radarr/qbittorrent|transmission`)
-  remain unimplemented; they are inactive in the current Java build (no Charon
-  dependency or route configuration).
+- The Charon downloader routes are absent by design, not a missing feature:
+  Java v3.1.0 removed them and replaced them with direct qBittorrent rename
+  (see the Charon note above).
 - No live A/B of admin login/CRUD, CLI commands, pagination, or timeouts was
   performed against the Java service or the NAS database. Verification used
   the in-process router, temporary SQLite databases, child-process CLI runs,

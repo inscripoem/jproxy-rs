@@ -61,6 +61,9 @@ reviewed:
   peer-credential authentication, job ids, SSE progress, cancellation, rename
   dry-run, downloader login, and a CLI equivalent to the admin UI.
 - Example/cache/system-config REST endpoints.
+- No Charon downloader proxy: Java v3.1.0 (commit `d3480bd`, 2023-04-11)
+  removed that reverse proxy and replaced it with direct qBittorrent rename.
+  Login and rename call the downloader APIs directly, matching current Java.
 - Resource target: total below 100 MB RSS.
 
 ## Acceptance

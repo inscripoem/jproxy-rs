@@ -73,10 +73,6 @@ Implemented:
 
 Not implemented (deferred Java behavior):
 
-- Downloader API proxying (the `/sonarr/qbittorrent`, `/sonarr/transmission`,
-  and Radarr equivalents of the Java Charon routes). Login and rename use the
-  downloader APIs directly. The Charon routes are inactive in the current Java
-  build as well: `pom.xml` has no Charon dependency and no route configuration.
 - Java's distributed/persistent caching and exact Caffeine eviction behaviour.
 
 ## Build and test
@@ -974,9 +970,14 @@ The `latest` tag is mutable. Compose does not pull it in the background; with
   (MIT, see `admin_dist/LICENSE.txt`) and served from disk; it is not rebuilt or
   downloaded at runtime. Unknown `/api/**` paths require authentication and
   return `403` without a token, then `404`, matching the Java interceptor.
-- **Charon routes.** `/sonarr|radarr/qbittorrent|transmission` remain
-  unimplemented. They are also inactive in the current Java build (no Charon
-  dependency or route configuration), so no working Java endpoint is missing.
+- **Charon downloader routes.** Java v3.1.0 (commit `d3480bd`, 2023-04-11)
+  removed the Charon reverse proxy and replaced it with direct qBittorrent
+  rename. The current Java build has no Charon dependency or route
+  registration; only unused `CHARON_*` and downloader filter path constants
+  remain in `Common.java`.
+  Login and rename here call the downloader APIs directly. The legacy
+  `/sonarr|radarr/qbittorrent|transmission` paths are absent in both
+  implementations, so this is not a parity gap.
 
 ## Project layout
 
