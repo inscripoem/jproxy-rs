@@ -2,6 +2,10 @@
 name = "jproxy-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Rust implementation of the jproxy Torznab proxy for Sonarr and Radarr"
+license = "MIT"
+repository = "https://github.com/inscripoem/jproxy-rs"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"

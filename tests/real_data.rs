@@ -4,6 +4,10 @@
 //! which copies only the five reference tables with `sqlite3 -readonly`. The
 //! expected counts below were read from the live database with
 //! `SELECT count(*)` at export time.
+//!
+//! Library titles are replaced by synthetic placeholders during export. Only
+//! the public works asserted here, and their TMDB alternates, retain their real
+//! titles.
 
 use std::path::Path;
 
@@ -61,6 +65,50 @@ async fn exports_and_imports_the_live_reference_counts() {
             .unwrap_or_else(|| panic!("{table} missing from import report"));
         assert_eq!(*count, *expected);
     }
+}
+
+#[tokio::test]
+async fn fixture_library_titles_are_anonymized() {
+    let pool = import::open_read_only(Path::new(FIXTURE)).await.unwrap();
+
+    let sonarr_unexpected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sonarr_title \
+         WHERE main_title <> 'Jackie Chan Adventures' \
+           AND main_title NOT GLOB 'Series [0-9]*'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sonarr_unexpected, 0,
+        "fixture contains a non-anonymized Sonarr title"
+    );
+
+    let radarr_unexpected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM radarr_title \
+         WHERE main_title <> 'The Fifth Element' \
+           AND main_title NOT GLOB 'Movie [0-9]*'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        radarr_unexpected, 0,
+        "fixture contains a non-anonymized Radarr title"
+    );
+
+    let tmdb_unexpected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tmdb_title \
+         WHERE tvdb_id <> 76711 \
+           AND title NOT GLOB 'Alternate [0-9]*'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tmdb_unexpected, 0,
+        "fixture contains a non-anonymized TMDB title"
+    );
 }
 
 #[tokio::test]

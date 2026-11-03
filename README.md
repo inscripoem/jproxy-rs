@@ -322,7 +322,10 @@ nix develop --command scripts/export-fixtures.sh [user@host] [remote.db] [output
 The fixture contains no `system_config`/`system_user` tables. Its row counts
 match the live `SELECT count(*)` values recorded at export time
 (`sonarr_title` 46, `radarr_title` 1535, `sonarr_rule` 90, `radarr_rule` 38,
-`tmdb_title` 20); `tests/real_data.rs` asserts them.
+`tmdb_title` 20); `tests/real_data.rs` asserts them. Library titles are
+replaced with synthetic placeholders during export; the only real titles
+retained are the public works asserted by that test (`Jackie Chan Adventures`
+and `The Fifth Element`, plus their TMDB alternates).
 
 ## Parity harness and local integration
 
@@ -982,3 +985,8 @@ fixtures/           exported reference DB and synthetic Torznab XML
 tests/              parity, sync, downloader, rename, admin, CLI and error tests
 scripts/            fixture export, local run and Java/Rust comparison
 ```
+
+## License
+
+MIT. The vendored admin UI under `admin_dist/` comes from the upstream Java
+project and carries its own MIT license in `admin_dist/LICENSE.txt`.

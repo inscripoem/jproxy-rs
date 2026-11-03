@@ -10,25 +10,21 @@ file, follow the operator.
 - `jproxy-rs` is a Rust rewrite of the Java jproxy (`LuckyPuppy514/jproxy`), a
   proxy between Sonarr/Radarr and Prowlarr/Jackett that rewrites Torznab
   queries and item titles.
-- The baseline lives on `main`: core proxy, query/title/rule rewriting,
-  caching, upstream error handling, and Sonarr/Radarr/TMDB synchronization.
-- This worktree, branch `features/full-parity`, adds the remaining Java
-  features: downloader login, rename tasks, admin UI/API/authentication, and
-  the supporting REST endpoints.
-- The milestone is 1:1 behavior parity with Java before any simplification.
-  Do not remove, collapse, or "clean up" behavior, response shapes, or edge
-  cases just because the Rust version is simpler. Match Java unless a
-  deviation is already documented and pinned by a test.
+- `main` contains the complete 0.1.0 implementation: core proxy, query, title
+  and rule rewriting, caching, upstream error handling, Sonarr/Radarr/TMDB
+  synchronization, downloader login, rename tasks, the admin UI/API and
+  authentication, and the operator CLI over the control socket.
+- The 0.1.0 milestone is 1:1 behavior parity with Java before any
+  simplification. Do not remove, collapse, or "clean up" behavior, response
+  shapes, or edge cases just because the Rust version is simpler. Match Java
+  unless a deviation is already documented and pinned by a test.
 
 ## Worktree discipline
 
-- Work only in `/home/inscripoem/dev/jproxy-rs-features` on
-  `features/full-parity`.
-- `/home/inscripoem/dev/jproxy-rs` is the main worktree and holds the `main`
-  baseline. Never edit, stage, commit, reset, checkout, or run builds that
-  mutate it.
-- Do not merge, rebase, cherry-pick, or copy commits between the worktrees
-  without an explicit request. Merge awaits review; do not push.
+- Work in the repository root. Create a separate worktree only for a large
+  isolated change, and only with an explicit request.
+- Do not merge, rebase, cherry-pick, push, or publish without an explicit
+  request from the operator.
 - The Java reference source is external, not vendored. Use the checkout at
   `/tmp/jproxy-src.KSddZV` when present, otherwise the upstream GitHub
   repository. Do not copy Java source into this tree.
@@ -91,8 +87,10 @@ the gate pass.
   servers for Sonarr/Radarr/TMDB/downloaders, a temporary SQLite database, and
   the real router. Reuse it instead of adding network-dependent tests.
 - Fixtures live under `fixtures/`: `fixtures/jproxy-live.db` is exported
-  reference data with no `system_config` or `system_user` rows;
-  `fixtures/torznab/*.xml` are synthetic Torznab responses.
+  reference data with no `system_config` or `system_user` rows; library titles
+  are replaced with synthetic placeholders except the public works pinned by
+  `tests/real_data.rs`. `fixtures/torznab/*.xml` are synthetic Torznab
+  responses.
 - Never call a real Sonarr, Radarr, TMDB, GitHub, downloader, or
   `tower.local` service from a test. Use loopback mock servers. Use synthetic
   users, API keys, passwords, cookies, and session ids only.
