@@ -10,7 +10,7 @@ let
   # The admin UI snapshot predates the current toolchain. nixos-24.05 keeps
   # Node 18 and pnpm 8 available; pnpm 8 migrates the upstream 5.4 lockfile
   # while preserving its resolved versions, and unlike pnpm 10 it still runs
-  # dependency lifecycle scripts.
+  # dependency lifecycle scripts. Node 18 is EOL; see admin-ui/README.md.
   uiPkgs = inputs.nixpkgs-ui.legacyPackages.${pkgs.system};
 in
 {

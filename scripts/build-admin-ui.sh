@@ -69,6 +69,22 @@ done
 test -f "$SRC_DIR/dist/index.html"
 grep -q '<title>jproxy-rs Admin</title>' "$SRC_DIR/dist/index.html"
 
+# Primary navigation must point at jproxy-rs. The upstream attribution link in
+# the footer is the only upstream GitHub URL allowed in the generated bundle.
+DIST_FILES=("$SRC_DIR/dist/index.html" "$SRC_DIR"/dist/assets/*.js)
+if grep -q -E 'LuckyPuppy514/jproxy/(issues|blob)' "${DIST_FILES[@]}"; then
+  echo "error: generated UI still contains upstream primary links" >&2
+  exit 1
+fi
+attribution_count=$(
+  { grep -o 'https://github\.com/LuckyPuppy514/jproxy' "${DIST_FILES[@]}" || true; } \
+    | wc -l
+)
+if [[ "$attribution_count" -ne 1 ]]; then
+  echo "error: expected one upstream attribution link, found $attribution_count" >&2
+  exit 1
+fi
+
 rm -rf "$ROOT_DIR/admin_dist/assets"
 cp -R "$SRC_DIR/dist/assets" "$ROOT_DIR/admin_dist/assets"
 cp "$SRC_DIR/dist/index.html" "$ROOT_DIR/admin_dist/index.html"

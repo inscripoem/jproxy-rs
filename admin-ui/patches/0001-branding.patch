@@ -39,10 +39,10 @@ index 9871186..176bc2e 100644
      color: rgb(var(--primary-6));
      background-color: rgba(0, 0, 0, 0);
 diff --git a/src/components/navbar/index.vue b/src/components/navbar/index.vue
-index 8a6742f..a79ae3f 100644
+index 8a6742f..13f320f 100644
 --- a/src/components/navbar/index.vue
 +++ b/src/components/navbar/index.vue
-@@ -16,7 +16,7 @@
+@@ -16,11 +16,11 @@
            }"
            :heading="5"
          >
@@ -51,6 +51,29 @@ index 8a6742f..a79ae3f 100644
          </a-typography-title>
          <a-link
            style="margin-top: 15px; font-size: 13px; color: var(--color-text-1)"
+-          href="https://github.com/LuckyPuppy514/jproxy/blob/main/changelog.md"
++          href="https://github.com/inscripoem/jproxy-rs/releases"
+           target="_blank"
+         >
+           v{{ version }}
+@@ -39,7 +39,7 @@
+       <li>
+         <a-tooltip :content="$t('navbar.github')">
+           <a-button
+-            href="https://github.com/LuckyPuppy514/jproxy"
++            href="https://github.com/inscripoem/jproxy-rs"
+             target="_blank"
+             class="nav-btn"
+             type="outline"
+@@ -52,7 +52,7 @@
+       <li>
+         <a-tooltip :content="$t('navbar.issue')">
+           <a-button
+-            href="https://github.com/LuckyPuppy514/jproxy/issues/new/choose"
++            href="https://github.com/inscripoem/jproxy-rs/issues/new/choose"
+             target="_blank"
+             class="nav-btn"
+             type="outline"
 diff --git a/src/views/login/components/login-form.vue b/src/views/login/components/login-form.vue
 index d40eb2f..0f4ddaa 100644
 --- a/src/views/login/components/login-form.vue

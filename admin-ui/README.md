@@ -44,6 +44,12 @@ Vue from 3.2 to 3.5. `pnpm install --shamefully-hoist` is required because
 `vue-tsc` needs the transitive `@types/node` that upstream never declared
 directly.
 
+Node 18 reached upstream EOL on 2025-04-30. The pin is kept because it is
+the cached toolchain in this environment; nixos-26.05 marks pnpm 8 as
+insecure and was not adopted. This is build-time tooling only; the emitted
+assets run in the browser. Revisit the pin when the upstream lockfile can be
+rebuilt or regenerated under a supported Node and pnpm 9+.
+
 ## Rebuild
 
 ```sh
@@ -60,8 +66,9 @@ and `admin_dist/NOTICE` are preserved.
 `admin-ui/patches/0001-branding.patch`:
 
 - `<title>` and login titles become `jproxy-rs Admin` / `jproxy-rs 管理后台`.
-- Navbar wordmark becomes `jproxy-rs`; layout, logo and version link are
-  unchanged.
+- Navbar wordmark becomes `jproxy-rs`; the GitHub, issue and
+  version/changelog links point to the jproxy-rs repository; layout and logo
+  are unchanged.
 - Footer links to the jproxy-rs repository and keeps the upstream
   `JProxy © 2023 LuckyPuppy514` attribution link.
 - The login page adds the non-affiliation disclaimer.
